@@ -1,5 +1,10 @@
 ![逐飞LOGO](https://images.gitee.com/uploads/images/2019/0924/114256_eaf16bad_1699060.png "逐飞科技logo 中.png")
 # 逐飞科技MSPM0G3519开源库
+
+> 主板接口开发请先阅读：[MSPM0G35XX 主板接口契约](MSPM0G35XX_MotherBoard_Interface_Contract.md)。
+>
+> 项目 GitHub 仓库：[Kiosksd/2026Diansai](https://github.com/Kiosksd/2026Diansai)，默认分支 `main`，Git remote 名称 `origin`。
+
 #### 简介
 该项目为逐飞科技基于德州仪器 LP_MSPM0G3519制作的MCU开源库。简化了部分库函数功能的使用步骤，便于使用MSPM0G3519参加竞赛以及进行产品开发。
 
@@ -72,4 +77,3 @@
    ![qq](assets/qq.png)
 
   **好了，本开源项目介绍就到这里了，本开源项目所使用的扩展板、核心板、外设模块均已上架逐飞淘宝店，感谢各位支持（shop480760048.taobao.com），你们的支持是我们开源的动力，如果能帮到大家，深感荣幸。时间紧张，水平有限，大神轻拍，如果开源项目中有任何BUG，欢迎留言反馈，逐飞会持续维护和完善，也可通过扫描上方的二维码加入QQ群与我们进行交流讨论（TI MCU开发交流群-逐飞科技：1046512191）。也欢迎各位持续关注“逐飞科技”微信公众号，逐飞的开源项目、技术分享及竞赛的相关信息更新都会在该公众号上发布。感谢！ 我们下一个开源项目再见。**
-

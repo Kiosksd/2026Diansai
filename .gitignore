@@ -32,6 +32,11 @@
 *.x86_64
 *.hex
 
+# Keil MDK generated files
+**/Objects/
+**/Listings/
+*.uvguix.*
+
 # Debug files
 *.dSYM/
 *.su
