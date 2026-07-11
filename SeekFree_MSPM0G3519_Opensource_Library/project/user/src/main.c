@@ -193,14 +193,12 @@ int main (void)
 #define MOTOR_PWM_FREQUENCY_HZ          ( 17000 )
 #define CONTROL_PERIOD_MS               ( 10 )
 #define PRINT_PERIOD_MS                 ( 100 )
-#define START_DELAY_MS                  ( 2000 )
-#define TEST_DURATION_MS                ( 10000 )
 
 // 单位：每 10ms 的编码器计数。首次循迹进一步降速，且不允许车轮反转。
 #define TRACK_BASE_TARGET_COUNT         ( 8 )
 #define TRACK_LOST_TARGET_COUNT         ( 5 )
 #define TRACK_TARGET_MAX                ( 14 )
-#define TRACK_STEER_LIMIT               ( 6 )
+#define TRACK_STEER_LIMIT               ( 12 )
 
 // GS08RA 实测：通道 0 在车体左侧，通道 7 在车体右侧；白底黑线时黑线为 0。
 // 偏差范围 -7..+7：负数表示黑线在左，正数表示黑线在右。
@@ -209,6 +207,14 @@ int main (void)
 #define TRACK_PD_KD_NUM                 ( 1 )
 #define TRACK_PD_GAIN_DIV               ( 2 )
 #define TRACK_LOST_STOP_TICKS           ( 150 / CONTROL_PERIOD_MS )
+
+// 直角弯：外侧探头连续命中后原地差速转向，中心重新捕线后恢复普通循迹。
+#define SHARP_TURN_ERROR_THRESHOLD      ( 5 )
+#define SHARP_TURN_LOST_THRESHOLD       ( 3 )
+#define SHARP_TURN_CONFIRM_TICKS        ( 2 )
+#define SHARP_TURN_SPEED_COUNT          ( 12 )
+#define SHARP_TURN_REACQUIRE_TICKS      ( 3 )
+#define SHARP_TURN_TIMEOUT_TICKS        ( 2500 / CONTROL_PERIOD_MS )
 
 // PWM_DUTY_MAX 为 10000。默认最大限制 3000，即 30%。
 #define PWM_OUTPUT_LIMIT                ( 3000 )
@@ -221,12 +227,6 @@ int main (void)
 #define SPEED_PI_KI                     ( 1 )
 #define SPEED_PI_INTEGRAL_LIMIT         ( 800 )
 
-#define TEST_CONTROL_TICKS              ( TEST_DURATION_MS / CONTROL_PERIOD_MS )
-
-#if ((TEST_DURATION_MS % CONTROL_PERIOD_MS) != 0)
-#error "TEST_DURATION_MS must be divisible by CONTROL_PERIOD_MS"
-#endif
-
 #if (PWM_OUTPUT_LIMIT > PWM_DUTY_MAX)
 #error "PWM_OUTPUT_LIMIT must not exceed PWM_DUTY_MAX"
 #endif
@@ -235,6 +235,13 @@ typedef struct
 {
     int32 integral;
 } speed_pi_struct;
+
+typedef enum
+{
+    TRACK_STATE_NORMAL = 0,
+    TRACK_STATE_TURN_LEFT,
+    TRACK_STATE_TURN_RIGHT,
+} track_state_enum;
 
 static speed_pi_struct left_speed_pi  = { 0 };
 static speed_pi_struct right_speed_pi = { 0 };
@@ -247,7 +254,6 @@ static volatile int32  left_pwm_output   = 0;
 static volatile int32  right_pwm_output  = 0;
 static volatile uint32 control_tick      = 0;
 static volatile bool   test_running      = false;
-static volatile bool   test_finished     = false;
 
 static int16 line_error       = 0;
 static int16 last_line_error  = 0;
@@ -255,6 +261,12 @@ static int16 track_correction = 0;
 static uint16 line_lost_ticks = 0;
 static bool line_detected     = false;
 static bool track_safety_stop = false;
+static track_state_enum track_state = TRACK_STATE_NORMAL;
+static int16 sharp_candidate_direction = 0;
+static uint16 sharp_candidate_ticks = 0;
+static uint16 sharp_turn_ticks = 0;
+static uint16 sharp_reacquire_ticks = 0;
+static bool sharp_turn_timeout_stop = false;
 
 static int32 limit_int32 (int32 value, int32 minimum, int32 maximum)
 {
@@ -281,7 +293,8 @@ static int32 speed_feedforward_calculate (int16 target)
     magnitude = (target > 0) ? target : -target;
     magnitude = SPEED_PWM_STATIC + SPEED_PWM_PER_COUNT * magnitude;
 
-    return (target > 0) ? magnitude : -magnitude;
+    // 返回无符号幅值；speed_pi_calculate 根据 target 正负添加输出方向。
+    return magnitude;
 }
 
 // 取最左、最右黑色通道，按官方公式计算二倍偏差：left + right - 7。
@@ -318,6 +331,21 @@ static bool line_error_calculate (int16 *error)
     return true;
 }
 
+static bool sensors_are_all_black (void)
+{
+    uint8 index;
+
+    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    {
+        if(0 != gs08ra_bin_val[index])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static void track_targets_set (int16 base_target, int16 correction)
 {
     // 黑线在右侧时 correction>0：物理左轮加速、物理右轮减速，使车辆右转。
@@ -331,6 +359,87 @@ static void track_targets_set (int16 base_target, int16 correction)
         TRACK_TARGET_MAX);
 }
 
+static bool center_line_is_detected (void)
+{
+    return ((0 == gs08ra_bin_val[3]) || (0 == gs08ra_bin_val[4]));
+}
+
+static void sharp_turn_targets_apply (void)
+{
+    if(TRACK_STATE_TURN_LEFT == track_state)
+    {
+        // 左转：物理左轮反转，物理右轮正转。
+        left_target_count = -SHARP_TURN_SPEED_COUNT;
+        right_target_count = SHARP_TURN_SPEED_COUNT;
+        track_correction = -SHARP_TURN_SPEED_COUNT;
+    }
+    else
+    {
+        // 右转：物理左轮正转，物理右轮反转。
+        left_target_count = SHARP_TURN_SPEED_COUNT;
+        right_target_count = -SHARP_TURN_SPEED_COUNT;
+        track_correction = SHARP_TURN_SPEED_COUNT;
+    }
+}
+
+static void sharp_turn_enter (track_state_enum new_state)
+{
+    track_state = new_state;
+    sharp_candidate_direction = 0;
+    sharp_candidate_ticks = 0;
+    sharp_turn_ticks = 0;
+    sharp_reacquire_ticks = 0;
+    line_lost_ticks = 0;
+    left_speed_pi.integral = 0;
+    right_speed_pi.integral = 0;
+    sharp_turn_targets_apply();
+
+    printf("RIGHT_ANGLE: enter %s turn.\r\n",
+        (TRACK_STATE_TURN_LEFT == track_state) ? "LEFT" : "RIGHT");
+}
+
+static bool sharp_turn_candidate_update (int16 error)
+{
+    int16 direction = 0;
+
+    if(error <= -SHARP_TURN_ERROR_THRESHOLD)
+    {
+        direction = -1;
+    }
+    else if(error >= SHARP_TURN_ERROR_THRESHOLD)
+    {
+        direction = 1;
+    }
+
+    if(0 == direction)
+    {
+        sharp_candidate_direction = 0;
+        sharp_candidate_ticks = 0;
+        return false;
+    }
+
+    if(direction == sharp_candidate_direction)
+    {
+        if(sharp_candidate_ticks < 0xFFFF)
+        {
+            sharp_candidate_ticks ++;
+        }
+    }
+    else
+    {
+        sharp_candidate_direction = direction;
+        sharp_candidate_ticks = 1;
+    }
+
+    if(sharp_candidate_ticks >= SHARP_TURN_CONFIRM_TICKS)
+    {
+        sharp_turn_enter((direction < 0) ? TRACK_STATE_TURN_LEFT : TRACK_STATE_TURN_RIGHT);
+        return true;
+    }
+
+    return false;
+}
+
 static void track_update (void)
 {
     int16 new_error;
@@ -339,11 +448,84 @@ static void track_update (void)
 
     line_detected = line_error_calculate(&new_error);
 
+    if(TRACK_STATE_NORMAL != track_state)
+    {
+        if(sharp_turn_ticks < 0xFFFF)
+        {
+            sharp_turn_ticks ++;
+        }
+
+        if(line_detected)
+        {
+            line_error = new_error;
+            last_line_error = new_error;
+        }
+        else
+        {
+            line_error = last_line_error;
+        }
+
+        sharp_turn_targets_apply();
+
+        if(line_detected
+        && center_line_is_detected()
+        && !sensors_are_all_black())
+        {
+            if(sharp_reacquire_ticks < 0xFFFF)
+            {
+                sharp_reacquire_ticks ++;
+            }
+
+            if(sharp_reacquire_ticks >= SHARP_TURN_REACQUIRE_TICKS)
+            {
+                track_state = TRACK_STATE_NORMAL;
+                sharp_turn_ticks = 0;
+                sharp_reacquire_ticks = 0;
+                line_lost_ticks = 0;
+                left_speed_pi.integral = 0;
+                right_speed_pi.integral = 0;
+                track_correction = 0;
+                track_targets_set(TRACK_BASE_TARGET_COUNT, 0);
+                printf("RIGHT_ANGLE: center line reacquired, resume normal tracking.\r\n");
+                return;
+            }
+        }
+        else
+        {
+            sharp_reacquire_ticks = 0;
+        }
+
+        if(sharp_turn_ticks >= SHARP_TURN_TIMEOUT_TICKS)
+        {
+            left_target_count = 0;
+            right_target_count = 0;
+            track_correction = 0;
+            sharp_turn_timeout_stop = true;
+            track_safety_stop = true;
+        }
+        return;
+    }
+
     if(line_detected)
     {
         line_lost_ticks = 0;
+
+        // 弯角可能短暂呈全黑；若进入全黑前已偏到边缘，优先按最后方向转弯。
+        if(sensors_are_all_black()
+        && ((last_line_error <= -SHARP_TURN_ERROR_THRESHOLD)
+         || (last_line_error >= SHARP_TURN_ERROR_THRESHOLD)))
+        {
+            sharp_turn_enter((last_line_error < 0) ? TRACK_STATE_TURN_LEFT : TRACK_STATE_TURN_RIGHT);
+            return;
+        }
+
         derivative = new_error - last_line_error;
         line_error = new_error;
+
+        if(sharp_turn_candidate_update(line_error))
+        {
+            return;
+        }
 
         correction = TRACK_PD_KP_NUM * line_error
                    + TRACK_PD_KD_NUM * derivative;
@@ -358,6 +540,17 @@ static void track_update (void)
     }
     else
     {
+        // 黑线从边缘消失通常意味着已经到达直角拐点，直接进入对应方向转向。
+        if((last_line_error <= -SHARP_TURN_LOST_THRESHOLD)
+        || (last_line_error >= SHARP_TURN_LOST_THRESHOLD))
+        {
+            sharp_turn_enter((last_line_error < 0) ? TRACK_STATE_TURN_LEFT : TRACK_STATE_TURN_RIGHT);
+            return;
+        }
+
+        sharp_candidate_direction = 0;
+        sharp_candidate_ticks = 0;
+
         if(line_lost_ticks < 0xFFFF)
         {
             line_lost_ticks ++;
@@ -478,16 +671,6 @@ static void speed_control_callback (uint32 event, void *ptr)
         return;
     }
 
-    if(control_tick >= TEST_CONTROL_TICKS)
-    {
-        test_running  = false;
-        test_finished = true;
-        left_pwm_output  = 0;
-        right_pwm_output = 0;
-        motor_stop();
-        return;
-    }
-
     current_left_target = left_target_count;
     current_right_target = right_target_count;
 
@@ -517,9 +700,77 @@ static void speed_control_callback (uint32 event, void *ptr)
     control_tick ++;
 }
 
+static void car_stop (const char *reason)
+{
+    test_running = false;
+    left_target_count = 0;
+    right_target_count = 0;
+    left_pwm_output = 0;
+    right_pwm_output = 0;
+    left_speed_pi.integral = 0;
+    right_speed_pi.integral = 0;
+    track_state = TRACK_STATE_NORMAL;
+    sharp_candidate_direction = 0;
+    sharp_candidate_ticks = 0;
+    sharp_turn_ticks = 0;
+    sharp_reacquire_ticks = 0;
+    motor_stop();
+
+    printf("STOP: %s. Motors stopped. Press KEY1 to start again.\r\n", reason);
+}
+
+static bool car_start (void)
+{
+    gs08ra_scan_read();
+
+    line_error = 0;
+    last_line_error = 0;
+    line_lost_ticks = 0;
+    track_safety_stop = false;
+    track_state = TRACK_STATE_NORMAL;
+    sharp_candidate_direction = 0;
+    sharp_candidate_ticks = 0;
+    sharp_turn_ticks = 0;
+    sharp_reacquire_ticks = 0;
+    sharp_turn_timeout_stop = false;
+    track_update();
+
+    if(!line_detected)
+    {
+        left_target_count = 0;
+        right_target_count = 0;
+        motor_stop();
+        printf("START ABORTED: no black line detected. Reposition the car and press KEY1.\r\n");
+        return false;
+    }
+
+    encoder_clear_count(ENCODER_LEFT_TIMER);
+    encoder_clear_count(ENCODER_RIGHT_TIMER);
+    left_speed_pi.integral = 0;
+    right_speed_pi.integral = 0;
+    control_tick = 0;
+    test_running = true;
+
+    printf("START BIN=%u%u%u%u%u%u%u%u error=%d Ltarget=%d Rtarget=%d\r\n",
+        gs08ra_bin_val[0],
+        gs08ra_bin_val[1],
+        gs08ra_bin_val[2],
+        gs08ra_bin_val[3],
+        gs08ra_bin_val[4],
+        gs08ra_bin_val[5],
+        gs08ra_bin_val[6],
+        gs08ra_bin_val[7],
+        line_error,
+        left_target_count,
+        right_target_count);
+
+    return true;
+}
+
 int main (void)
 {
     uint16 print_elapsed_ms = 0;
+    key_state_enum key_state;
 
     clock_init(SYSTEM_CLOCK_80M);                                               // 时钟配置及系统初始化<务必保留>
 
@@ -536,71 +787,52 @@ int main (void)
     encoder_quad_init(ENCODER_RIGHT_TIMER, ENCODER_RIGHT_A, ENCODER_RIGHT_B);
     gs08ra_init();
     gs08ra_set_threshold(GS08RA_BINARY_THRESHOLD);
+    key_init(CONTROL_PERIOD_MS);
 
     pit_ms_init(CONTROL_PIT, CONTROL_PERIOD_MS, speed_control_callback, NULL);
     interrupt_global_enable(0);
 
-    printf("\r\nGS08RA corrected low-speed line-follow test.\r\n");
+    printf("\r\nGS08RA key-controlled line-follow.\r\n");
     printf("Physical mapping: LEFT=CH2/TIMG8, RIGHT=CH1/TIMG9.\r\n");
-    printf("Place the black line under the sensor center before reset.\r\n");
-    printf("Start after %d ms, stop after %d ms; lost line %d ms -> safety stop.\r\n",
-        START_DELAY_MS,
-        TEST_DURATION_MS,
+    printf("KEY1(A30): press once to start, press again to stop.\r\n");
+    printf("Lost line %d ms -> forced stop.\r\n",
         TRACK_LOST_STOP_TICKS * CONTROL_PERIOD_MS);
+    printf("Right-angle: edge confirm %d ms, pivot speed=%d, timeout=%d ms.\r\n",
+        SHARP_TURN_CONFIRM_TICKS * CONTROL_PERIOD_MS,
+        SHARP_TURN_SPEED_COUNT,
+        SHARP_TURN_TIMEOUT_TICKS * CONTROL_PERIOD_MS);
     printf("Base=%d count/%dms, steering limit=%d, PWM limit=%d.\r\n",
         TRACK_BASE_TARGET_COUNT,
         CONTROL_PERIOD_MS,
         TRACK_STEER_LIMIT,
         PWM_OUTPUT_LIMIT);
+    printf("IDLE: place the car on the black line, then press KEY1.\r\n");
 
-    system_delay_ms(START_DELAY_MS);
-
-    gs08ra_scan_read();
-    line_lost_ticks = 0;
-    track_safety_stop = false;
-    track_update();
-
-    printf("START BIN=%u%u%u%u%u%u%u%u detected=%u error=%d "
-           "Ltarget=%d Rtarget=%d\r\n",
-        gs08ra_bin_val[0],
-        gs08ra_bin_val[1],
-        gs08ra_bin_val[2],
-        gs08ra_bin_val[3],
-        gs08ra_bin_val[4],
-        gs08ra_bin_val[5],
-        gs08ra_bin_val[6],
-        gs08ra_bin_val[7],
-        line_detected ? 1 : 0,
-        line_error,
-        left_target_count,
-        right_target_count);
-
-    if(!line_detected)
-    {
-        motor_stop();
-        printf("START ABORTED: no black line detected. Reposition the car and reset.\r\n");
-
-        while(true)
-        {
-            system_delay_ms(1000);
-        }
-    }
-
-    encoder_clear_count(ENCODER_LEFT_TIMER);
-    encoder_clear_count(ENCODER_RIGHT_TIMER);
-    left_speed_pi.integral  = 0;
-    right_speed_pi.integral = 0;
-    control_tick  = 0;
-    test_finished = false;
-    test_running  = true;
-
-    while(!test_finished)
+    while(true)
     {
         system_delay_ms(CONTROL_PERIOD_MS);
+        key_scanner();
+        key_state = key_get_state(KEY_1);
 
-        if(test_finished)
+        if(KEY_SHORT_PRESS == key_state)
         {
-            break;
+            key_clear_state(KEY_1);
+
+            if(test_running)
+            {
+                car_stop("KEY1 pressed");
+            }
+            else
+            {
+                car_start();
+            }
+
+            print_elapsed_ms = 0;
+        }
+
+        if(!test_running)
+        {
+            continue;
         }
 
         gs08ra_scan_read();
@@ -608,20 +840,20 @@ int main (void)
 
         if(track_safety_stop)
         {
-            test_running = false;
-            test_finished = true;
-            left_pwm_output = 0;
-            right_pwm_output = 0;
-            motor_stop();
+            car_stop(sharp_turn_timeout_stop
+                ? "right-angle turn timeout"
+                : "line lost safety");
+            continue;
         }
 
         print_elapsed_ms += CONTROL_PERIOD_MS;
         if(print_elapsed_ms >= PRINT_PERIOD_MS)
         {
             print_elapsed_ms = 0;
-            printf("t=%ums BIN=%u%u%u%u%u%u%u%u det=%u err=%d turn=%d lost=%u "
-                   "L[t=%d c=%d p=%d] R[t=%d c=%d p=%d]\r\n",
+            printf("t=%ums state=%d BIN=%u%u%u%u%u%u%u%u det=%u err=%d turn=%d "
+                   "lost=%u sharp=%u L[t=%d c=%d p=%d] R[t=%d c=%d p=%d]\r\n",
                 (unsigned int)(control_tick * CONTROL_PERIOD_MS),
+                track_state,
                 gs08ra_bin_val[0],
                 gs08ra_bin_val[1],
                 gs08ra_bin_val[2],
@@ -634,6 +866,7 @@ int main (void)
                 line_error,
                 track_correction,
                 line_lost_ticks,
+                sharp_turn_ticks,
                 left_target_count,
                 left_speed_count,
                 (int)left_pwm_output,
@@ -641,23 +874,6 @@ int main (void)
                 right_speed_count,
                 (int)right_pwm_output);
         }
-    }
-
-    motor_stop();
-    if(track_safety_stop)
-    {
-        printf("Safety stop: black line lost for %d ms.\r\n",
-            TRACK_LOST_STOP_TICKS * CONTROL_PERIOD_MS);
-    }
-    else
-    {
-        printf("Line-follow test finished after %d ms.\r\n", TEST_DURATION_MS);
-    }
-    printf("Motors stopped. Press reset to run again.\r\n");
-
-    while(true)
-    {
-        system_delay_ms(1000);
     }
 }
 
