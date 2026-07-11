@@ -161,51 +161,59 @@ int main (void)
 
 #else
 
-// 本程序用于验证：
-// 1. 两路 AB 相编码器在固定 10ms 周期内的速度计数
-// 2. 两路 DRV8701E 电机能否分别跟随相同的目标速度
-// 3. 左右轮 PI 输出是否稳定
-//
-// 安全提示：第一次运行请架空车轮。上电后等待 2 秒，电机运行 5 秒后自动停止。
+// 低速闭环循迹测试：GS08RA 计算黑线偏差，PD 外环产生物理左右轮目标速度，
+// 两路编码器 PI 内环分别跟随目标速度。
+// 安全提示：启动时无黑线则拒绝起步；丢线 150ms 或运行 3 秒后自动停止。
 
 // -------------------------------- 主板接口 --------------------------------
-#define MOTOR_LEFT_DIR                  ( A1 )
-#define MOTOR_LEFT_PWM                  ( PWM_TIM_A0_CH0_A0 )
+#define MOTOR_LEFT_DIR                  ( B13 )
+#define MOTOR_LEFT_PWM                  ( PWM_TIM_A0_CH2_B12 )
 #define MOTOR_LEFT_FORWARD_LEVEL        ( GPIO_HIGH )
-#define MOTOR_RIGHT_DIR                 ( B13 )
-#define MOTOR_RIGHT_PWM                 ( PWM_TIM_A0_CH2_B12 )
+#define MOTOR_RIGHT_DIR                 ( A1 )
+#define MOTOR_RIGHT_PWM                 ( PWM_TIM_A0_CH0_A0 )
 #define MOTOR_RIGHT_FORWARD_LEVEL       ( GPIO_HIGH )
 
 // 2026-07-11 实车映射测试：A0/A1 驱动 TIMG9 编码器；B12/B13 驱动 TIMG8 编码器。
+// 物理轮位复测：CH1(A0/A1) 是右轮，CH2(B12/B13) 是左轮。
 // 物理方向复测：左右轮在 DIR=HIGH 时均驱动车辆前进。
-// 左轮在车辆前进时原始计数为正；右轮原始计数为负，因此仅对右轮反馈取反。
-#define ENCODER_LEFT_TIMER              ( TIM_G9 )
-#define ENCODER_LEFT_A                  ( TIMG9_ENCODER1_CH1_B7 )
-#define ENCODER_LEFT_B                  ( TIMG9_ENCODER1_CH2_B9 )
-#define ENCODER_LEFT_SIGN               ( 1 )
-#define ENCODER_RIGHT_TIMER             ( TIM_G8 )
-#define ENCODER_RIGHT_A                 ( TIMG8_ENCODER1_CH1_A26 )
-#define ENCODER_RIGHT_B                 ( TIMG8_ENCODER1_CH2_A27 )
-#define ENCODER_RIGHT_SIGN              ( -1 )
+// 左轮在车辆前进时原始计数为负，右轮原始计数为正，因此仅对左轮反馈取反。
+#define ENCODER_LEFT_TIMER              ( TIM_G8 )
+#define ENCODER_LEFT_A                  ( TIMG8_ENCODER1_CH1_A26 )
+#define ENCODER_LEFT_B                  ( TIMG8_ENCODER1_CH2_A27 )
+#define ENCODER_LEFT_SIGN               ( -1 )
+#define ENCODER_RIGHT_TIMER             ( TIM_G9 )
+#define ENCODER_RIGHT_A                 ( TIMG9_ENCODER1_CH1_B7 )
+#define ENCODER_RIGHT_B                 ( TIMG9_ENCODER1_CH2_B9 )
+#define ENCODER_RIGHT_SIGN              ( 1 )
 
 // TIMA0 已被电机 PWM 使用，TIMG8/TIMG9 已被编码器使用，因此控制周期使用 TIMG0。
 #define CONTROL_PIT                     ( PIT_TIM_G0 )
 
-// -------------------------------- 测试参数 --------------------------------
+// -------------------------------- 控制参数 --------------------------------
 #define MOTOR_PWM_FREQUENCY_HZ          ( 17000 )
 #define CONTROL_PERIOD_MS               ( 10 )
 #define PRINT_PERIOD_MS                 ( 100 )
 #define START_DELAY_MS                  ( 2000 )
-#define TEST_DURATION_MS                ( 5000 )
+#define TEST_DURATION_MS                ( 10000 )
 
-// 单位：每 10ms 的编码器计数。速度内环已在目标 20 时完成实车验证。
-#define LEFT_TARGET_COUNT               ( 20 )
-#define RIGHT_TARGET_COUNT              ( 20 )
+// 单位：每 10ms 的编码器计数。首次循迹进一步降速，且不允许车轮反转。
+#define TRACK_BASE_TARGET_COUNT         ( 8 )
+#define TRACK_LOST_TARGET_COUNT         ( 5 )
+#define TRACK_TARGET_MAX                ( 14 )
+#define TRACK_STEER_LIMIT               ( 6 )
+
+// GS08RA 实测：通道 0 在车体左侧，通道 7 在车体右侧；白底黑线时黑线为 0。
+// 偏差范围 -7..+7：负数表示黑线在左，正数表示黑线在右。
+#define GS08RA_BINARY_THRESHOLD         ( 30 )
+#define TRACK_PD_KP_NUM                 ( 2 )
+#define TRACK_PD_KD_NUM                 ( 1 )
+#define TRACK_PD_GAIN_DIV               ( 2 )
+#define TRACK_LOST_STOP_TICKS           ( 150 / CONTROL_PERIOD_MS )
 
 // PWM_DUTY_MAX 为 10000。默认最大限制 3000，即 30%。
 #define PWM_OUTPUT_LIMIT                ( 3000 )
-#define LEFT_PWM_FEEDFORWARD            ( 1500 )
-#define RIGHT_PWM_FEEDFORWARD           ( 1500 )
+#define SPEED_PWM_STATIC                ( 300 )
+#define SPEED_PWM_PER_COUNT             ( 70 )
 
 // 整数 PI：Kp 的单位为 PWM/计数；Ki 每个 10ms 控制周期累加一次。
 // 首次测试以稳定和安全为主，后续根据串口曲线再调整。
@@ -233,11 +241,20 @@ static speed_pi_struct right_speed_pi = { 0 };
 
 static volatile int16  left_speed_count  = 0;
 static volatile int16  right_speed_count = 0;
+static volatile int16  left_target_count = 0;
+static volatile int16  right_target_count = 0;
 static volatile int32  left_pwm_output   = 0;
 static volatile int32  right_pwm_output  = 0;
 static volatile uint32 control_tick      = 0;
 static volatile bool   test_running      = false;
 static volatile bool   test_finished     = false;
+
+static int16 line_error       = 0;
+static int16 last_line_error  = 0;
+static int16 track_correction = 0;
+static uint16 line_lost_ticks = 0;
+static bool line_detected     = false;
+static bool track_safety_stop = false;
 
 static int32 limit_int32 (int32 value, int32 minimum, int32 maximum)
 {
@@ -250,6 +267,121 @@ static int32 limit_int32 (int32 value, int32 minimum, int32 maximum)
         value = maximum;
     }
     return value;
+}
+
+static int32 speed_feedforward_calculate (int16 target)
+{
+    int32 magnitude;
+
+    if(0 == target)
+    {
+        return 0;
+    }
+
+    magnitude = (target > 0) ? target : -target;
+    magnitude = SPEED_PWM_STATIC + SPEED_PWM_PER_COUNT * magnitude;
+
+    return (target > 0) ? magnitude : -magnitude;
+}
+
+// 取最左、最右黑色通道，按官方公式计算二倍偏差：left + right - 7。
+static bool line_error_calculate (int16 *error)
+{
+    int16 left = -1;
+    int16 right = -1;
+    uint8 index;
+
+    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    {
+        if(0 == gs08ra_bin_val[index])
+        {
+            left = index;
+            break;
+        }
+    }
+
+    for(index = GS08A_CHANNEL_NUM; index > 0; index --)
+    {
+        if(0 == gs08ra_bin_val[index - 1])
+        {
+            right = index - 1;
+            break;
+        }
+    }
+
+    if((left < 0) || (right < 0))
+    {
+        return false;
+    }
+
+    *error = left + right - (GS08A_CHANNEL_NUM - 1);
+    return true;
+}
+
+static void track_targets_set (int16 base_target, int16 correction)
+{
+    // 黑线在右侧时 correction>0：物理左轮加速、物理右轮减速，使车辆右转。
+    left_target_count = (int16)limit_int32(
+        base_target + correction,
+        0,
+        TRACK_TARGET_MAX);
+    right_target_count = (int16)limit_int32(
+        base_target - correction,
+        0,
+        TRACK_TARGET_MAX);
+}
+
+static void track_update (void)
+{
+    int16 new_error;
+    int16 derivative;
+    int32 correction;
+
+    line_detected = line_error_calculate(&new_error);
+
+    if(line_detected)
+    {
+        line_lost_ticks = 0;
+        derivative = new_error - last_line_error;
+        line_error = new_error;
+
+        correction = TRACK_PD_KP_NUM * line_error
+                   + TRACK_PD_KD_NUM * derivative;
+        correction /= TRACK_PD_GAIN_DIV;
+        track_correction = (int16)limit_int32(
+            correction,
+            -TRACK_STEER_LIMIT,
+            TRACK_STEER_LIMIT);
+
+        last_line_error = line_error;
+        track_targets_set(TRACK_BASE_TARGET_COUNT, track_correction);
+    }
+    else
+    {
+        if(line_lost_ticks < 0xFFFF)
+        {
+            line_lost_ticks ++;
+        }
+
+        line_error = last_line_error;
+
+        if(line_lost_ticks >= TRACK_LOST_STOP_TICKS)
+        {
+            left_target_count = 0;
+            right_target_count = 0;
+            track_correction = 0;
+            track_safety_stop = true;
+        }
+        else
+        {
+            // 短暂丢线时降速，并按最后一次偏差方向寻找黑线。
+            track_correction = (int16)limit_int32(
+                last_line_error,
+                -TRACK_STEER_LIMIT,
+                TRACK_STEER_LIMIT);
+            track_targets_set(TRACK_LOST_TARGET_COUNT, track_correction);
+        }
+    }
 }
 
 static void motor_set_output (
@@ -327,6 +459,9 @@ static int32 speed_pi_calculate (
 
 static void speed_control_callback (uint32 event, void *ptr)
 {
+    int16 current_left_target;
+    int16 current_right_target;
+
     (void)event;
     (void)ptr;
 
@@ -353,17 +488,20 @@ static void speed_control_callback (uint32 event, void *ptr)
         return;
     }
 
+    current_left_target = left_target_count;
+    current_right_target = right_target_count;
+
     left_pwm_output = speed_pi_calculate(
         &left_speed_pi,
-        LEFT_TARGET_COUNT,
+        current_left_target,
         left_speed_count,
-        LEFT_PWM_FEEDFORWARD);
+        speed_feedforward_calculate(current_left_target));
 
     right_pwm_output = speed_pi_calculate(
         &right_speed_pi,
-        RIGHT_TARGET_COUNT,
+        current_right_target,
         right_speed_count,
-        RIGHT_PWM_FEEDFORWARD);
+        speed_feedforward_calculate(current_right_target));
 
     motor_set_output(
         MOTOR_LEFT_DIR,
@@ -381,33 +519,72 @@ static void speed_control_callback (uint32 event, void *ptr)
 
 int main (void)
 {
+    uint16 print_elapsed_ms = 0;
+
     clock_init(SYSTEM_CLOCK_80M);                                               // 时钟配置及系统初始化<务必保留>
-    debug_init();                                                               // 调试串口信息初始化
 
-    system_delay_ms(300);                                                       // 等待主板外设电源稳定
-
+    // 复位释放后尽早把 PWM 置 0；按住 RESET 时仍需硬件下拉保证停机。
     gpio_init(MOTOR_LEFT_DIR, GPO, MOTOR_LEFT_FORWARD_LEVEL, GPO_PUSH_PULL);
     gpio_init(MOTOR_RIGHT_DIR, GPO, MOTOR_RIGHT_FORWARD_LEVEL, GPO_PUSH_PULL);
     pwm_init(MOTOR_LEFT_PWM, MOTOR_PWM_FREQUENCY_HZ, 0);
     pwm_init(MOTOR_RIGHT_PWM, MOTOR_PWM_FREQUENCY_HZ, 0);
 
+    debug_init();                                                               // 调试串口信息初始化
+    system_delay_ms(300);                                                       // 等待主板外设电源稳定
+
     encoder_quad_init(ENCODER_LEFT_TIMER, ENCODER_LEFT_A, ENCODER_LEFT_B);
     encoder_quad_init(ENCODER_RIGHT_TIMER, ENCODER_RIGHT_A, ENCODER_RIGHT_B);
+    gs08ra_init();
+    gs08ra_set_threshold(GS08RA_BINARY_THRESHOLD);
 
     pit_ms_init(CONTROL_PIT, CONTROL_PERIOD_MS, speed_control_callback, NULL);
     interrupt_global_enable(0);
 
-    printf("\r\nDRV8701E dual motor speed PI test.\r\n");
-    printf("Lift wheels before first run. Start after %d ms, stop after %d ms.\r\n",
+    printf("\r\nGS08RA corrected low-speed line-follow test.\r\n");
+    printf("Physical mapping: LEFT=CH2/TIMG8, RIGHT=CH1/TIMG9.\r\n");
+    printf("Place the black line under the sensor center before reset.\r\n");
+    printf("Start after %d ms, stop after %d ms; lost line %d ms -> safety stop.\r\n",
         START_DELAY_MS,
-        TEST_DURATION_MS);
-    printf("Target: left=%d, right=%d count/%dms; PWM limit=%d.\r\n",
-        LEFT_TARGET_COUNT,
-        RIGHT_TARGET_COUNT,
+        TEST_DURATION_MS,
+        TRACK_LOST_STOP_TICKS * CONTROL_PERIOD_MS);
+    printf("Base=%d count/%dms, steering limit=%d, PWM limit=%d.\r\n",
+        TRACK_BASE_TARGET_COUNT,
         CONTROL_PERIOD_MS,
+        TRACK_STEER_LIMIT,
         PWM_OUTPUT_LIMIT);
 
     system_delay_ms(START_DELAY_MS);
+
+    gs08ra_scan_read();
+    line_lost_ticks = 0;
+    track_safety_stop = false;
+    track_update();
+
+    printf("START BIN=%u%u%u%u%u%u%u%u detected=%u error=%d "
+           "Ltarget=%d Rtarget=%d\r\n",
+        gs08ra_bin_val[0],
+        gs08ra_bin_val[1],
+        gs08ra_bin_val[2],
+        gs08ra_bin_val[3],
+        gs08ra_bin_val[4],
+        gs08ra_bin_val[5],
+        gs08ra_bin_val[6],
+        gs08ra_bin_val[7],
+        line_detected ? 1 : 0,
+        line_error,
+        left_target_count,
+        right_target_count);
+
+    if(!line_detected)
+    {
+        motor_stop();
+        printf("START ABORTED: no black line detected. Reposition the car and reset.\r\n");
+
+        while(true)
+        {
+            system_delay_ms(1000);
+        }
+    }
 
     encoder_clear_count(ENCODER_LEFT_TIMER);
     encoder_clear_count(ENCODER_RIGHT_TIMER);
@@ -419,20 +596,64 @@ int main (void)
 
     while(!test_finished)
     {
-        system_delay_ms(PRINT_PERIOD_MS);
+        system_delay_ms(CONTROL_PERIOD_MS);
 
-        printf("t=%ums L[target=%d count=%d pwm=%d] R[target=%d count=%d pwm=%d]\r\n",
-            (unsigned int)(control_tick * CONTROL_PERIOD_MS),
-            LEFT_TARGET_COUNT,
-            left_speed_count,
-            (int)left_pwm_output,
-            RIGHT_TARGET_COUNT,
-            right_speed_count,
-            (int)right_pwm_output);
+        if(test_finished)
+        {
+            break;
+        }
+
+        gs08ra_scan_read();
+        track_update();
+
+        if(track_safety_stop)
+        {
+            test_running = false;
+            test_finished = true;
+            left_pwm_output = 0;
+            right_pwm_output = 0;
+            motor_stop();
+        }
+
+        print_elapsed_ms += CONTROL_PERIOD_MS;
+        if(print_elapsed_ms >= PRINT_PERIOD_MS)
+        {
+            print_elapsed_ms = 0;
+            printf("t=%ums BIN=%u%u%u%u%u%u%u%u det=%u err=%d turn=%d lost=%u "
+                   "L[t=%d c=%d p=%d] R[t=%d c=%d p=%d]\r\n",
+                (unsigned int)(control_tick * CONTROL_PERIOD_MS),
+                gs08ra_bin_val[0],
+                gs08ra_bin_val[1],
+                gs08ra_bin_val[2],
+                gs08ra_bin_val[3],
+                gs08ra_bin_val[4],
+                gs08ra_bin_val[5],
+                gs08ra_bin_val[6],
+                gs08ra_bin_val[7],
+                line_detected ? 1 : 0,
+                line_error,
+                track_correction,
+                line_lost_ticks,
+                left_target_count,
+                left_speed_count,
+                (int)left_pwm_output,
+                right_target_count,
+                right_speed_count,
+                (int)right_pwm_output);
+        }
     }
 
     motor_stop();
-    printf("Test finished. Motors stopped. Press reset to run again.\r\n");
+    if(track_safety_stop)
+    {
+        printf("Safety stop: black line lost for %d ms.\r\n",
+            TRACK_LOST_STOP_TICKS * CONTROL_PERIOD_MS);
+    }
+    else
+    {
+        printf("Line-follow test finished after %d ms.\r\n", TEST_DURATION_MS);
+    }
+    printf("Motors stopped. Press reset to run again.\r\n");
 
     while(true)
     {
