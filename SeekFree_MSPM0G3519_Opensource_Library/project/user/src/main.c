@@ -41,6 +41,797 @@
 
 // **************************** 代码区域 ****************************
 
+// 新电机重新标定期间优先启用安全无线调试模式。
+// 此模式不会初始化循迹、编码器闭环或陀螺仪；电机仅响应无线单通道短脉冲命令，其余时间 PWM=0。
+#define NEW_MOTOR_SAFE_WIRELESS_TEST    ( 1 )
+
+#if NEW_MOTOR_SAFE_WIRELESS_TEST
+
+#define SAFE_TEST_MOTOR_CH1_DIR         ( A1 )
+#define SAFE_TEST_MOTOR_CH1_PWM         ( PWM_TIM_A0_CH0_A0 )
+#define SAFE_TEST_MOTOR_CH2_DIR         ( B13 )
+#define SAFE_TEST_MOTOR_CH2_PWM         ( PWM_TIM_A0_CH2_B12 )
+#define SAFE_TEST_MOTOR_PWM_FREQUENCY   ( 17000 )
+#define SAFE_TEST_ENCODER_G8_TIMER       ( TIM_G8 )
+#define SAFE_TEST_ENCODER_G8_A           ( TIMG8_ENCODER1_CH1_A26 )
+#define SAFE_TEST_ENCODER_G8_B           ( TIMG8_ENCODER1_CH2_A27 )
+#define SAFE_TEST_ENCODER_G9_TIMER       ( TIM_G9 )
+#define SAFE_TEST_ENCODER_G9_A           ( TIMG9_ENCODER1_CH1_B7 )
+#define SAFE_TEST_ENCODER_G9_B           ( TIMG9_ENCODER1_CH2_B9 )
+#define SAFE_TEST_ENCODER_PERIOD_MS      ( 100 )
+#define SAFE_TEST_MOTOR_PULSE_MS         ( 400 )
+#define SAFE_TEST_MOTOR_PWM_DEFAULT      ( 1000 )
+#define SAFE_TEST_MOTOR_PWM_MINIMUM      ( 600 )
+#define SAFE_TEST_MOTOR_PWM_MAXIMUM      ( 2000 )
+#define SAFE_TEST_MOTOR_PWM_STEP         ( 200 )
+
+#define SAFE_TEST_STAGE_OPEN_LOOP        ( 1 )
+#define SAFE_TEST_STAGE_SINGLE_WHEEL_PI  ( 2 )
+#define SAFE_TEST_STAGE                  ( SAFE_TEST_STAGE_SINGLE_WHEEL_PI )
+
+static void safe_test_motors_stop (void)
+{
+    pwm_set_duty(SAFE_TEST_MOTOR_CH1_PWM, 0);
+    pwm_set_duty(SAFE_TEST_MOTOR_CH2_PWM, 0);
+}
+
+#if (SAFE_TEST_STAGE == SAFE_TEST_STAGE_OPEN_LOOP)
+
+static bool safe_test_motor_pulse_start (uint8 command, uint16 pwm_duty)
+{
+    safe_test_motors_stop();
+
+    switch(command)
+    {
+        case '1':
+        {
+            gpio_set_level(SAFE_TEST_MOTOR_CH1_DIR, GPIO_LOW);
+            pwm_set_duty(SAFE_TEST_MOTOR_CH1_PWM, pwm_duty);
+        }break;
+
+        case '2':
+        {
+            gpio_set_level(SAFE_TEST_MOTOR_CH1_DIR, GPIO_HIGH);
+            pwm_set_duty(SAFE_TEST_MOTOR_CH1_PWM, pwm_duty);
+        }break;
+
+        case '3':
+        {
+            gpio_set_level(SAFE_TEST_MOTOR_CH2_DIR, GPIO_LOW);
+            pwm_set_duty(SAFE_TEST_MOTOR_CH2_PWM, pwm_duty);
+        }break;
+
+        case '4':
+        {
+            gpio_set_level(SAFE_TEST_MOTOR_CH2_DIR, GPIO_HIGH);
+            pwm_set_duty(SAFE_TEST_MOTOR_CH2_PWM, pwm_duty);
+        }break;
+
+        default:
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int main (void)
+{
+    uint8 receive_buffer[WIRELESS_UART_BUFFER_SIZE];
+    char send_buffer[96];
+    uint32 receive_length;
+    uint32 receive_index;
+    uint16 encoder_elapsed_ms = 0;
+    uint16 motor_pulse_elapsed_ms = 0;
+    uint16 motor_test_pwm = SAFE_TEST_MOTOR_PWM_DEFAULT;
+    int16 encoder_g8_count;
+    int16 encoder_g9_count;
+    int32 motor_test_g8_total = 0;
+    int32 motor_test_g9_total = 0;
+    uint8 command;
+    uint8 motor_test_command = 0;
+    bool motor_pulse_active = false;
+
+    clock_init(SYSTEM_CLOCK_80M);
+
+    // 复位释放后尽早建立确定的 DIR 电平和 0 占空比。
+    gpio_init(SAFE_TEST_MOTOR_CH1_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    gpio_init(SAFE_TEST_MOTOR_CH2_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    pwm_init(SAFE_TEST_MOTOR_CH1_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    pwm_init(SAFE_TEST_MOTOR_CH2_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    safe_test_motors_stop();
+
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G8_TIMER,
+        SAFE_TEST_ENCODER_G8_A,
+        SAFE_TEST_ENCODER_G8_B);
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G9_TIMER,
+        SAFE_TEST_ENCODER_G9_A,
+        SAFE_TEST_ENCODER_G9_B);
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+    debug_init();
+    system_delay_ms(300);
+
+    if(wireless_uart_init())
+    {
+        printf("WIRELESS INIT FAILED. Motors remain stopped.\r\n");
+        while(true)
+        {
+            safe_test_motors_stop();
+            system_delay_ms(10);
+        }
+    }
+
+    interrupt_global_enable(0);
+
+    printf("\r\nNEW MOTOR SAFE WIRELESS TEST.\r\n");
+    printf("CH1(A0/A1) PWM=0, CH2(B12/B13) PWM=0.\r\n");
+    printf("Encoder increments are reported every %d ms. Motors remain stopped.\r\n",
+        SAFE_TEST_ENCODER_PERIOD_MS);
+
+    wireless_uart_send_string("\r\nMANUAL ENCODER MAPPING TEST READY\r\n");
+    wireless_uart_send_string("MOTORS: CH1 PWM=0, CH2 PWM=0\r\n");
+    wireless_uart_send_string("ENCODERS: G8=A26/A27, G9=B7/B9, PERIOD=100ms\r\n");
+    wireless_uart_send_string("1=CH1 LOW, 2=CH1 HIGH, 3=CH2 LOW, 4=CH2 HIGH\r\n");
+    wireless_uart_send_string("0=STOP, +/-=PWM STEP, ?=STATUS; DEFAULT PWM=1000\r\n");
+
+    while(true)
+    {
+        if(!motor_pulse_active)
+        {
+            safe_test_motors_stop();
+        }
+
+        receive_length = wireless_uart_read_buffer(
+            receive_buffer,
+            WIRELESS_UART_BUFFER_SIZE);
+
+        if(receive_length > 0)
+        {
+            printf("WIRELESS RX length=%lu\r\n", (unsigned long)receive_length);
+
+            for(receive_index = 0; receive_index < receive_length; receive_index ++)
+            {
+                command = receive_buffer[receive_index];
+
+                switch(command)
+                {
+                    case '1':
+                    case '2':
+                    case '3':
+                    case '4':
+                    {
+                        safe_test_motors_stop();
+                        encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+                        encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+                        motor_test_g8_total = 0;
+                        motor_test_g9_total = 0;
+                        motor_pulse_elapsed_ms = 0;
+                        motor_test_command = command;
+                        motor_pulse_active = safe_test_motor_pulse_start(
+                            command,
+                            motor_test_pwm);
+
+                        sprintf(
+                            send_buffer,
+                            "START CMD=%c PWM=%u PULSE=%ums\r\n",
+                            command,
+                            motor_test_pwm,
+                            SAFE_TEST_MOTOR_PULSE_MS);
+                        wireless_uart_send_string(send_buffer);
+                    }break;
+
+                    case '0':
+                    {
+                        safe_test_motors_stop();
+                        motor_pulse_active = false;
+                        motor_test_command = 0;
+                        wireless_uart_send_string("STOP: BOTH MOTOR PWM=0\r\n");
+                    }break;
+
+                    case '+':
+                    {
+                        if(motor_pulse_active)
+                        {
+                            wireless_uart_send_string("WAIT: MOTOR PULSE ACTIVE\r\n");
+                            break;
+                        }
+                        if(motor_test_pwm < SAFE_TEST_MOTOR_PWM_MAXIMUM)
+                        {
+                            motor_test_pwm += SAFE_TEST_MOTOR_PWM_STEP;
+                            if(motor_test_pwm > SAFE_TEST_MOTOR_PWM_MAXIMUM)
+                            {
+                                motor_test_pwm = SAFE_TEST_MOTOR_PWM_MAXIMUM;
+                            }
+                        }
+                        sprintf(send_buffer, "PWM SET=%u\r\n", motor_test_pwm);
+                        wireless_uart_send_string(send_buffer);
+                    }break;
+
+                    case '-':
+                    {
+                        if(motor_pulse_active)
+                        {
+                            wireless_uart_send_string("WAIT: MOTOR PULSE ACTIVE\r\n");
+                            break;
+                        }
+                        if(motor_test_pwm > SAFE_TEST_MOTOR_PWM_MINIMUM)
+                        {
+                            motor_test_pwm -= SAFE_TEST_MOTOR_PWM_STEP;
+                            if(motor_test_pwm < SAFE_TEST_MOTOR_PWM_MINIMUM)
+                            {
+                                motor_test_pwm = SAFE_TEST_MOTOR_PWM_MINIMUM;
+                            }
+                        }
+                        sprintf(send_buffer, "PWM SET=%u\r\n", motor_test_pwm);
+                        wireless_uart_send_string(send_buffer);
+                    }break;
+
+                    case '?':
+                    {
+                        sprintf(
+                            send_buffer,
+                            "STATUS: PWM=%u ACTIVE=%u CMD=%c\r\n",
+                            motor_test_pwm,
+                            motor_pulse_active ? 1 : 0,
+                            motor_pulse_active ? motor_test_command : '-');
+                        wireless_uart_send_string(send_buffer);
+                    }break;
+
+                    case 'H':
+                    case 'h':
+                    {
+                        wireless_uart_send_string(
+                            "1=CH1 LOW,2=CH1 HIGH,3=CH2 LOW,4=CH2 HIGH,0=STOP,+/-=PWM\r\n");
+                    }break;
+
+                    default:
+                    {
+                        // Ignore CR, LF and unknown bytes.
+                    }break;
+                }
+            }
+        }
+
+        encoder_elapsed_ms += 10;
+        if(encoder_elapsed_ms >= SAFE_TEST_ENCODER_PERIOD_MS)
+        {
+            encoder_elapsed_ms = 0;
+            encoder_g8_count = encoder_get_count(SAFE_TEST_ENCODER_G8_TIMER);
+            encoder_g9_count = encoder_get_count(SAFE_TEST_ENCODER_G9_TIMER);
+            encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+            encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+            if(motor_pulse_active)
+            {
+                motor_test_g8_total += encoder_g8_count;
+                motor_test_g9_total += encoder_g9_count;
+            }
+
+            sprintf(
+                send_buffer,
+                "ENC G8=%d G9=%d\r\n",
+                encoder_g8_count,
+                encoder_g9_count);
+            wireless_uart_send_string(send_buffer);
+        }
+
+        if(motor_pulse_active)
+        {
+            motor_pulse_elapsed_ms += 10;
+            if(motor_pulse_elapsed_ms >= SAFE_TEST_MOTOR_PULSE_MS)
+            {
+                safe_test_motors_stop();
+
+                encoder_g8_count = encoder_get_count(SAFE_TEST_ENCODER_G8_TIMER);
+                encoder_g9_count = encoder_get_count(SAFE_TEST_ENCODER_G9_TIMER);
+                encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+                encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+                motor_test_g8_total += encoder_g8_count;
+                motor_test_g9_total += encoder_g9_count;
+                motor_pulse_active = false;
+
+                sprintf(
+                    send_buffer,
+                    "RESULT CMD=%c PWM=%u G8_TOTAL=%ld G9_TOTAL=%ld\r\n",
+                    motor_test_command,
+                    motor_test_pwm,
+                    (long)motor_test_g8_total,
+                    (long)motor_test_g9_total);
+                wireless_uart_send_string(send_buffer);
+                motor_test_command = 0;
+            }
+        }
+
+        system_delay_ms(10);
+    }
+}
+
+#else
+
+#define SAFE_PI_CONTROL_PIT              ( PIT_TIM_G0 )
+#define SAFE_PI_CONTROL_PERIOD_MS        ( 10 )
+#define SAFE_PI_PRINT_PERIOD_MS          ( 100 )
+#define SAFE_PI_TEST_DURATION_MS         ( 3000 )
+#define SAFE_PI_TEST_DURATION_TICKS      ( SAFE_PI_TEST_DURATION_MS / SAFE_PI_CONTROL_PERIOD_MS )
+#define SAFE_PI_TARGET_COUNT             ( 8 )
+#define SAFE_PI_FEEDFORWARD_STATIC       ( 250 )
+#define SAFE_PI_FEEDFORWARD_PER_COUNT    ( 105 )
+#define SAFE_PI_KP                       ( 35 )
+#define SAFE_PI_KI                       ( 1 )
+#define SAFE_PI_INTEGRAL_LIMIT           ( 500 )
+#define SAFE_PI_PWM_LIMIT                ( 2000 )
+#define SAFE_PI_GS08RA_THRESHOLD         ( 30 )
+
+typedef enum
+{
+    SAFE_PI_IDLE = 0,
+    SAFE_PI_LEFT,
+    SAFE_PI_RIGHT,
+    SAFE_PI_BOTH,
+} safe_pi_mode_enum;
+
+static volatile safe_pi_mode_enum safe_pi_mode = SAFE_PI_IDLE;
+static volatile safe_pi_mode_enum safe_pi_finished_mode = SAFE_PI_IDLE;
+static volatile int16 safe_pi_left_count = 0;
+static volatile int16 safe_pi_right_count = 0;
+static volatile int32 safe_pi_left_pwm = 0;
+static volatile int32 safe_pi_right_pwm = 0;
+static volatile int32 safe_pi_left_integral = 0;
+static volatile int32 safe_pi_right_integral = 0;
+static volatile int32 safe_pi_left_total = 0;
+static volatile int32 safe_pi_right_total = 0;
+static volatile int32 safe_pi_finished_left_total = 0;
+static volatile int32 safe_pi_finished_right_total = 0;
+static volatile uint16 safe_pi_test_tick = 0;
+static volatile bool safe_pi_finished = false;
+
+static int32 safe_pi_limit (int32 value, int32 minimum, int32 maximum)
+{
+    if(value < minimum)
+    {
+        value = minimum;
+    }
+    else if(value > maximum)
+    {
+        value = maximum;
+    }
+    return value;
+}
+
+static bool safe_gray_error_calculate (int16 *error)
+{
+    int16 left = -1;
+    int16 right = -1;
+    uint8 index;
+
+    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    {
+        if(0 == gs08ra_bin_val[index])
+        {
+            left = index;
+            break;
+        }
+    }
+
+    for(index = GS08A_CHANNEL_NUM; index > 0; index --)
+    {
+        if(0 == gs08ra_bin_val[index - 1])
+        {
+            right = index - 1;
+            break;
+        }
+    }
+
+    if((left < 0) || (right < 0))
+    {
+        return false;
+    }
+
+    *error = left + right - (GS08A_CHANNEL_NUM - 1);
+    return true;
+}
+
+static int32 safe_pi_calculate (int16 measured_count, volatile int32 *integral)
+{
+    int32 error;
+    int32 output;
+
+    error = SAFE_PI_TARGET_COUNT - measured_count;
+    *integral = safe_pi_limit(
+        *integral + error,
+        -SAFE_PI_INTEGRAL_LIMIT,
+        SAFE_PI_INTEGRAL_LIMIT);
+
+    output = SAFE_PI_FEEDFORWARD_STATIC
+           + SAFE_PI_FEEDFORWARD_PER_COUNT * SAFE_PI_TARGET_COUNT
+           + SAFE_PI_KP * error
+           + SAFE_PI_KI * (*integral);
+
+    return safe_pi_limit(output, 0, SAFE_PI_PWM_LIMIT);
+}
+
+static void safe_pi_control_callback (uint32 event, void *ptr)
+{
+    safe_pi_mode_enum current_mode;
+    int16 raw_g8_count;
+    int16 raw_g9_count;
+
+    (void)event;
+    (void)ptr;
+
+    raw_g8_count = encoder_get_count(SAFE_TEST_ENCODER_G8_TIMER);
+    raw_g9_count = encoder_get_count(SAFE_TEST_ENCODER_G9_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+    safe_pi_left_count = (int16)(-raw_g8_count);
+    safe_pi_right_count = raw_g9_count;
+    current_mode = safe_pi_mode;
+
+    if(SAFE_PI_IDLE == current_mode)
+    {
+        safe_pi_left_pwm = 0;
+        safe_pi_right_pwm = 0;
+        safe_test_motors_stop();
+        return;
+    }
+
+    if((SAFE_PI_LEFT == current_mode) || (SAFE_PI_BOTH == current_mode))
+    {
+        safe_pi_left_pwm = safe_pi_calculate(
+            safe_pi_left_count,
+            &safe_pi_left_integral);
+        safe_pi_left_total += safe_pi_left_count;
+    }
+    else
+    {
+        safe_pi_left_pwm = 0;
+    }
+
+    if((SAFE_PI_RIGHT == current_mode) || (SAFE_PI_BOTH == current_mode))
+    {
+        safe_pi_right_pwm = safe_pi_calculate(
+            safe_pi_right_count,
+            &safe_pi_right_integral);
+        safe_pi_right_total += safe_pi_right_count;
+    }
+    else
+    {
+        safe_pi_right_pwm = 0;
+    }
+
+    pwm_set_duty(SAFE_TEST_MOTOR_CH1_PWM, (uint16)safe_pi_left_pwm);
+    pwm_set_duty(SAFE_TEST_MOTOR_CH2_PWM, (uint16)safe_pi_right_pwm);
+
+    safe_pi_test_tick ++;
+    if(safe_pi_test_tick >= SAFE_PI_TEST_DURATION_TICKS)
+    {
+        safe_pi_finished_mode = current_mode;
+        safe_pi_finished_left_total = safe_pi_left_total;
+        safe_pi_finished_right_total = safe_pi_right_total;
+        safe_pi_mode = SAFE_PI_IDLE;
+        safe_pi_left_pwm = 0;
+        safe_pi_right_pwm = 0;
+        safe_pi_finished = true;
+        safe_test_motors_stop();
+    }
+}
+
+static bool safe_pi_test_start (safe_pi_mode_enum new_mode)
+{
+    if(SAFE_PI_IDLE != safe_pi_mode)
+    {
+        return false;
+    }
+
+    safe_test_motors_stop();
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+    safe_pi_left_count = 0;
+    safe_pi_right_count = 0;
+    safe_pi_left_pwm = 0;
+    safe_pi_right_pwm = 0;
+    safe_pi_left_integral = 0;
+    safe_pi_right_integral = 0;
+    safe_pi_left_total = 0;
+    safe_pi_right_total = 0;
+    safe_pi_test_tick = 0;
+    safe_pi_finished = false;
+    safe_pi_finished_mode = SAFE_PI_IDLE;
+    safe_pi_mode = new_mode;
+    return true;
+}
+
+int main (void)
+{
+    uint8 receive_buffer[WIRELESS_UART_BUFFER_SIZE];
+    char send_buffer[192];
+    uint32 receive_length;
+    uint32 receive_index;
+    uint16 print_elapsed_ms = 0;
+    uint8 command;
+    int16 gray_error;
+    bool gray_detected;
+    safe_pi_mode_enum finished_mode;
+    int32 finished_left_total;
+    int32 finished_right_total;
+
+    clock_init(SYSTEM_CLOCK_80M);
+
+    gpio_init(SAFE_TEST_MOTOR_CH1_DIR, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    gpio_init(SAFE_TEST_MOTOR_CH2_DIR, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    pwm_init(SAFE_TEST_MOTOR_CH1_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    pwm_init(SAFE_TEST_MOTOR_CH2_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    safe_test_motors_stop();
+
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G8_TIMER,
+        SAFE_TEST_ENCODER_G8_A,
+        SAFE_TEST_ENCODER_G8_B);
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G9_TIMER,
+        SAFE_TEST_ENCODER_G9_A,
+        SAFE_TEST_ENCODER_G9_B);
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+    debug_init();
+    system_delay_ms(300);
+
+    gs08ra_init();
+    gs08ra_set_threshold(SAFE_PI_GS08RA_THRESHOLD);
+
+    if(wireless_uart_init())
+    {
+        printf("WIRELESS INIT FAILED. Motors remain stopped.\r\n");
+        while(true)
+        {
+            safe_test_motors_stop();
+            system_delay_ms(10);
+        }
+    }
+
+    pit_ms_init(
+        SAFE_PI_CONTROL_PIT,
+        SAFE_PI_CONTROL_PERIOD_MS,
+        safe_pi_control_callback,
+        NULL);
+    interrupt_global_enable(0);
+
+    printf("\r\nNEW MOTOR SINGLE-WHEEL PI TEST.\r\n");
+    printf("Target=%d count/%dms, duration=%dms, PWM limit=%d.\r\n",
+        SAFE_PI_TARGET_COUNT,
+        SAFE_PI_CONTROL_PERIOD_MS,
+        SAFE_PI_TEST_DURATION_MS,
+        SAFE_PI_PWM_LIMIT);
+
+    wireless_uart_send_string("\r\nSINGLE-WHEEL SPEED PI TEST READY\r\n");
+    wireless_uart_send_string("L=LEFT, R=RIGHT, B=BOTH FORWARD PI, 0=STOP\r\n");
+    wireless_uart_send_string("G=GS08RA SNAPSHOT (MOTORS MUST BE IDLE)\r\n");
+    wireless_uart_send_string("TARGET=8 count/10ms, DURATION=3000ms, PWM_LIMIT=2000\r\n");
+    wireless_uart_send_string("LIFT WHEELS AND WAIT FOR RESULT BEFORE NEXT COMMAND\r\n");
+
+    while(true)
+    {
+        receive_length = wireless_uart_read_buffer(
+            receive_buffer,
+            WIRELESS_UART_BUFFER_SIZE);
+
+        for(receive_index = 0; receive_index < receive_length; receive_index ++)
+        {
+            command = receive_buffer[receive_index];
+
+            switch(command)
+            {
+                case 'L':
+                case 'l':
+                {
+                    if(safe_pi_test_start(SAFE_PI_LEFT))
+                    {
+                        print_elapsed_ms = 0;
+                        wireless_uart_send_string("START PI LEFT/CH1\r\n");
+                    }
+                    else
+                    {
+                        wireless_uart_send_string("BUSY: SEND 0 OR WAIT\r\n");
+                    }
+                }break;
+
+                case 'R':
+                case 'r':
+                {
+                    if(safe_pi_test_start(SAFE_PI_RIGHT))
+                    {
+                        print_elapsed_ms = 0;
+                        wireless_uart_send_string("START PI RIGHT/CH2\r\n");
+                    }
+                    else
+                    {
+                        wireless_uart_send_string("BUSY: SEND 0 OR WAIT\r\n");
+                    }
+                }break;
+
+                case 'B':
+                case 'b':
+                {
+                    if(safe_pi_test_start(SAFE_PI_BOTH))
+                    {
+                        print_elapsed_ms = 0;
+                        wireless_uart_send_string("START PI BOTH: LEFT/CH1 + RIGHT/CH2\r\n");
+                    }
+                    else
+                    {
+                        wireless_uart_send_string("BUSY: SEND 0 OR WAIT\r\n");
+                    }
+                }break;
+
+                case '0':
+                {
+                    safe_pi_mode = SAFE_PI_IDLE;
+                    safe_pi_left_pwm = 0;
+                    safe_pi_right_pwm = 0;
+                    safe_pi_finished = false;
+                    safe_test_motors_stop();
+                    wireless_uart_send_string("STOP: BOTH MOTOR PWM=0\r\n");
+                }break;
+
+                case '?':
+                {
+                    sprintf(
+                        send_buffer,
+                        "STATUS MODE=%d TARGET=%d L[c=%d p=%ld] R[c=%d p=%ld]\r\n",
+                        safe_pi_mode,
+                        SAFE_PI_TARGET_COUNT,
+                        safe_pi_left_count,
+                        (long)safe_pi_left_pwm,
+                        safe_pi_right_count,
+                        (long)safe_pi_right_pwm);
+                    wireless_uart_send_string(send_buffer);
+                }break;
+
+                case 'G':
+                case 'g':
+                {
+                    if(SAFE_PI_IDLE != safe_pi_mode)
+                    {
+                        wireless_uart_send_string("BUSY: SEND 0 OR WAIT BEFORE GRAY TEST\r\n");
+                        break;
+                    }
+
+                    safe_test_motors_stop();
+                    gs08ra_scan_read();
+                    gray_detected = safe_gray_error_calculate(&gray_error);
+                    if(!gray_detected)
+                    {
+                        gray_error = 99;
+                    }
+
+                    sprintf(
+                        send_buffer,
+                        "GRAY BIN=%u%u%u%u%u%u%u%u det=%u err=%d "
+                        "RAW=%u,%u,%u,%u,%u,%u,%u,%u "
+                        "NORM=%u,%u,%u,%u,%u,%u,%u,%u TH=%u\r\n",
+                        gs08ra_bin_val[0],
+                        gs08ra_bin_val[1],
+                        gs08ra_bin_val[2],
+                        gs08ra_bin_val[3],
+                        gs08ra_bin_val[4],
+                        gs08ra_bin_val[5],
+                        gs08ra_bin_val[6],
+                        gs08ra_bin_val[7],
+                        gray_detected,
+                        gray_error,
+                        gs08ra_raw_val[0],
+                        gs08ra_raw_val[1],
+                        gs08ra_raw_val[2],
+                        gs08ra_raw_val[3],
+                        gs08ra_raw_val[4],
+                        gs08ra_raw_val[5],
+                        gs08ra_raw_val[6],
+                        gs08ra_raw_val[7],
+                        gs08ra_deal_val[0],
+                        gs08ra_deal_val[1],
+                        gs08ra_deal_val[2],
+                        gs08ra_deal_val[3],
+                        gs08ra_deal_val[4],
+                        gs08ra_deal_val[5],
+                        gs08ra_deal_val[6],
+                        gs08ra_deal_val[7],
+                        gs08ra_threshold);
+                    wireless_uart_send_string(send_buffer);
+                }break;
+
+                default:
+                {
+                    // Ignore CR, LF and unknown bytes.
+                }break;
+            }
+        }
+
+        if(SAFE_PI_IDLE != safe_pi_mode)
+        {
+            print_elapsed_ms += 10;
+            if(print_elapsed_ms >= SAFE_PI_PRINT_PERIOD_MS)
+            {
+                print_elapsed_ms = 0;
+                if(SAFE_PI_BOTH == safe_pi_mode)
+                {
+                    sprintf(
+                        send_buffer,
+                        "PI B t=%ums target=%d L[c=%d p=%ld] R[c=%d p=%ld]\r\n",
+                        (unsigned int)(safe_pi_test_tick * SAFE_PI_CONTROL_PERIOD_MS),
+                        SAFE_PI_TARGET_COUNT,
+                        safe_pi_left_count,
+                        (long)safe_pi_left_pwm,
+                        safe_pi_right_count,
+                        (long)safe_pi_right_pwm);
+                }
+                else
+                {
+                    sprintf(
+                        send_buffer,
+                        "PI %c t=%ums target=%d count=%d pwm=%ld\r\n",
+                        (SAFE_PI_LEFT == safe_pi_mode) ? 'L' : 'R',
+                        (unsigned int)(safe_pi_test_tick * SAFE_PI_CONTROL_PERIOD_MS),
+                        SAFE_PI_TARGET_COUNT,
+                        (SAFE_PI_LEFT == safe_pi_mode)
+                            ? safe_pi_left_count
+                            : safe_pi_right_count,
+                        (long)((SAFE_PI_LEFT == safe_pi_mode)
+                            ? safe_pi_left_pwm
+                            : safe_pi_right_pwm));
+                }
+                wireless_uart_send_string(send_buffer);
+            }
+        }
+
+        if(safe_pi_finished)
+        {
+            finished_mode = safe_pi_finished_mode;
+            finished_left_total = safe_pi_finished_left_total;
+            finished_right_total = safe_pi_finished_right_total;
+            safe_pi_finished = false;
+            if(SAFE_PI_BOTH == finished_mode)
+            {
+                sprintf(
+                    send_buffer,
+                    "RESULT PI BOTH TARGET=%d L[total=%ld avg_x100=%ld] R[total=%ld avg_x100=%ld]\r\n",
+                    SAFE_PI_TARGET_COUNT,
+                    (long)finished_left_total,
+                    (long)((finished_left_total * 100) / SAFE_PI_TEST_DURATION_TICKS),
+                    (long)finished_right_total,
+                    (long)((finished_right_total * 100) / SAFE_PI_TEST_DURATION_TICKS));
+            }
+            else
+            {
+                finished_left_total = (SAFE_PI_LEFT == finished_mode)
+                    ? finished_left_total
+                    : finished_right_total;
+                sprintf(
+                    send_buffer,
+                    "RESULT PI %s TARGET=%d TOTAL=%ld AVG_X100=%ld\r\n",
+                    (SAFE_PI_LEFT == finished_mode) ? "LEFT" : "RIGHT",
+                    SAFE_PI_TARGET_COUNT,
+                    (long)finished_left_total,
+                    (long)((finished_left_total * 100) / SAFE_PI_TEST_DURATION_TICKS));
+            }
+            wireless_uart_send_string(send_buffer);
+            wireless_uart_send_string("MOTOR STOPPED; SEND NEXT COMMAND\r\n");
+        }
+
+        system_delay_ms(10);
+    }
+}
+
+#endif // SAFE_TEST_STAGE
+
+#else
+
 // 当前先执行电机通道与编码器通道映射测试。
 // 映射确认后将此宏改为 0，即可重新启用下方保留的速度 PI 程序。
 #define MOTOR_ENCODER_MAPPING_TEST      ( 0 )
@@ -166,16 +957,15 @@ int main (void)
 // 安全提示：启动时无黑线则拒绝起步；丢线 150ms 或运行 3 秒后自动停止。
 
 // -------------------------------- 主板接口 --------------------------------
-#define MOTOR_LEFT_DIR                  ( B13 )
-#define MOTOR_LEFT_PWM                  ( PWM_TIM_A0_CH2_B12 )
+#define MOTOR_LEFT_DIR                  ( A1 )
+#define MOTOR_LEFT_PWM                  ( PWM_TIM_A0_CH0_A0 )
 #define MOTOR_LEFT_FORWARD_LEVEL        ( GPIO_HIGH )
-#define MOTOR_RIGHT_DIR                 ( A1 )
-#define MOTOR_RIGHT_PWM                 ( PWM_TIM_A0_CH0_A0 )
+#define MOTOR_RIGHT_DIR                 ( B13 )
+#define MOTOR_RIGHT_PWM                 ( PWM_TIM_A0_CH2_B12 )
 #define MOTOR_RIGHT_FORWARD_LEVEL       ( GPIO_HIGH )
 
-// 2026-07-11 实车映射测试：A0/A1 驱动 TIMG9 编码器；B12/B13 驱动 TIMG8 编码器。
-// 物理轮位复测：CH1(A0/A1) 是右轮，CH2(B12/B13) 是左轮。
-// 物理方向复测：左右轮在 DIR=HIGH 时均驱动车辆前进。
+// 2026-07-25 更换电机后重新实测：CH1(A0/A1) 驱动物理左轮/TIMG8；
+// CH2(B12/B13) 驱动物理右轮/TIMG9，左右轮在 DIR=HIGH 时均驱动车辆前进。
 // 左轮在车辆前进时原始计数为负，右轮原始计数为正，因此仅对左轮反馈取反。
 #define ENCODER_LEFT_TIMER              ( TIM_G8 )
 #define ENCODER_LEFT_A                  ( TIMG8_ENCODER1_CH1_A26 )
@@ -194,11 +984,29 @@ int main (void)
 #define CONTROL_PERIOD_MS               ( 10 )
 #define PRINT_PERIOD_MS                 ( 100 )
 
-// 单位：每 10ms 的编码器计数。首次循迹进一步降速，且不允许车轮反转。
-#define TRACK_BASE_TARGET_COUNT         ( 8 )
+// Wireless UART V2.4 uses UART1: MCU TX B6, MCU RX B5, RTS B2, 115200 baud.
+// Commands are single bytes so the receiver never waits for a line ending.
+#define WIRELESS_COMMAND_START           ( 'S' )
+#define WIRELESS_COMMAND_STOP            ( 'P' )
+
+// Gyroscope UART: B15 is UART7 TX and B16 is UART7 RX.
+// The sensor sends: 0A 03 04 angle_H angle_L dps_H dps_L CRC16_L CRC16_H.
+#define GYRO_UART_INDEX                  ( UART_7 )
+#define GYRO_UART_BAUDRATE               ( 115200 )
+#define GYRO_UART_TX_PIN                 ( UART7_TX_B15 )
+#define GYRO_UART_RX_PIN                 ( UART7_RX_B16 )
+#define GYRO_FRAME_LENGTH                ( 9 )
+#define GYRO_PRINT_PERIOD_MS             ( 100 )
+#define GYRO_ANGLE_SCALE_X100            ( 977 )
+
+// 单位：每 10ms 的编码器计数。直道采用原速度的三倍，进入弯道后自动降速。
+#define TRACK_STRAIGHT_TARGET_COUNT     ( 24 )
+#define TRACK_CURVE_TARGET_COUNT        ( 16 )
 #define TRACK_LOST_TARGET_COUNT         ( 5 )
-#define TRACK_TARGET_MAX                ( 14 )
+#define TRACK_TARGET_MAX                ( 28 )
 #define TRACK_STEER_LIMIT               ( 12 )
+#define TRACK_STRAIGHT_ERROR_LIMIT      ( 1 )
+#define TRACK_STRAIGHT_CORRECTION_LIMIT ( 2 )
 
 // GS08RA 实测：通道 0 在车体左侧，通道 7 在车体右侧；白底黑线时黑线为 0。
 // 偏差范围 -7..+7：负数表示黑线在左，正数表示黑线在右。
@@ -208,13 +1016,48 @@ int main (void)
 #define TRACK_PD_GAIN_DIV               ( 2 )
 #define TRACK_LOST_STOP_TICKS           ( 150 / CONTROL_PERIOD_MS )
 
-// 直角弯：外侧探头连续命中后原地差速转向，中心重新捕线后恢复普通循迹。
+// 直角弯处理方案：
+// 方案一：两轮均向前，慢速弧线转约 45 度，避免原地转向直接脱线。
+// 方案二：先较快直行约 10 cm，再执行低速原地差速转向。
+#define SHARP_TURN_SCHEME_ARC_45        ( 1 )
+#define SHARP_TURN_SCHEME_ADVANCE_10CM  ( 2 )
+#ifndef SHARP_TURN_SCHEME
+#define SHARP_TURN_SCHEME               ( SHARP_TURN_SCHEME_ADVANCE_10CM )
+#endif
+
 #define SHARP_TURN_ERROR_THRESHOLD      ( 5 )
 #define SHARP_TURN_LOST_THRESHOLD       ( 3 )
 #define SHARP_TURN_CONFIRM_TICKS        ( 2 )
-#define SHARP_TURN_SPEED_COUNT          ( 12 )
 #define SHARP_TURN_REACQUIRE_TICKS      ( 3 )
-#define SHARP_TURN_TIMEOUT_TICKS        ( 2500 / CONTROL_PERIOD_MS )
+#define SHARP_TURN_NO_GYRO_MIN_TICKS    ( 300 / CONTROL_PERIOD_MS )
+#define SHARP_TURN_TIMEOUT_TICKS        ( 6000 / CONTROL_PERIOD_MS )
+
+// 所有转弯速度均明显低于原来的 12 count/10ms，降低云台晃动。
+#define SHARP_TURN_ARC_INNER_COUNT      ( 2 )
+#define SHARP_TURN_ARC_OUTER_COUNT      ( 6 )
+#define SHARP_TURN_ARC_FINE_INNER_COUNT ( 2 )
+#define SHARP_TURN_ARC_FINE_OUTER_COUNT ( 4 )
+#define SHARP_TURN_PIVOT_COUNT          ( 5 )
+#define SHARP_TURN_PIVOT_FINE_COUNT     ( 4 )
+#define SHARP_TURN_EXIT_FORWARD_COUNT   ( 3 )
+#define SHARP_TURN_ADVANCE_COUNT        ( 7 )
+
+// 方案二按左右轮平均编码器累计值控制前进距离。
+// 750 由原 8 cm/600 count 等比例换算为约 10 cm；实车测量后只需微调此值。
+#define SHARP_TURN_ADVANCE_10CM_ENCODER_COUNT ( 750 )
+
+// 陀螺仪角度单位为 0.01 度。
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ARC_45)
+#define SHARP_TURN_GYRO_SLOW_ANGLE      ( 3000 )
+#define SHARP_TURN_GYRO_REACQUIRE_ANGLE ( 3500 )
+#define SHARP_TURN_GYRO_TARGET_ANGLE    ( 4500 )
+#elif (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ADVANCE_10CM)
+#define SHARP_TURN_GYRO_SLOW_ANGLE      ( 6500 )
+#define SHARP_TURN_GYRO_REACQUIRE_ANGLE ( 7500 )
+#define SHARP_TURN_GYRO_TARGET_ANGLE    ( 8800 )
+#else
+#error "Unsupported SHARP_TURN_SCHEME"
+#endif
 
 // PWM_DUTY_MAX 为 10000。默认最大限制 3000，即 30%。
 #define PWM_OUTPUT_LIMIT                ( 3000 )
@@ -243,6 +1086,13 @@ typedef enum
     TRACK_STATE_TURN_RIGHT,
 } track_state_enum;
 
+typedef enum
+{
+    SHARP_TURN_PHASE_TURN = 0,
+    SHARP_TURN_PHASE_ADVANCE,
+    SHARP_TURN_PHASE_EXIT,
+} sharp_turn_phase_enum;
+
 static speed_pi_struct left_speed_pi  = { 0 };
 static speed_pi_struct right_speed_pi = { 0 };
 
@@ -254,6 +1104,16 @@ static volatile int32  left_pwm_output   = 0;
 static volatile int32  right_pwm_output  = 0;
 static volatile uint32 control_tick      = 0;
 static volatile bool   test_running      = false;
+static bool            wireless_ready    = false;
+
+// Latest valid gyroscope angle. The ISR owns writes; the foreground reads a
+// consistent snapshot through gyro_data_get(). Angle = angle_raw / 9.77 deg.
+static volatile int16  gyro_angle_raw    = 0;
+static volatile bool   gyro_new_data     = false;
+static volatile bool   gyro_data_valid   = false;
+static uint8           gyro_frame[GYRO_FRAME_LENGTH];
+static uint8           gyro_parser_state = 0;
+static uint8           gyro_frame_index  = 0;
 
 static int16 line_error       = 0;
 static int16 last_line_error  = 0;
@@ -265,8 +1125,15 @@ static track_state_enum track_state = TRACK_STATE_NORMAL;
 static int16 sharp_candidate_direction = 0;
 static uint16 sharp_candidate_ticks = 0;
 static uint16 sharp_turn_ticks = 0;
+static uint16 sharp_turn_phase_ticks = 0;
 static uint16 sharp_reacquire_ticks = 0;
 static bool sharp_turn_timeout_stop = false;
+static bool sharp_turn_gyro_active = false;
+static bool sharp_turn_gyro_target_reached = false;
+static int32 sharp_turn_start_angle_centidegree = 0;
+static int32 sharp_turn_angle_centidegree = 0;
+static volatile sharp_turn_phase_enum sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+static volatile uint32 sharp_turn_advance_encoder_count = 0;
 
 static int32 limit_int32 (int32 value, int32 minimum, int32 maximum)
 {
@@ -279,6 +1146,196 @@ static int32 limit_int32 (int32 value, int32 minimum, int32 maximum)
         value = maximum;
     }
     return value;
+}
+
+static uint16 gyro_crc16_calculate (const uint8 *buffer, uint8 length)
+{
+    uint16 crc = 0xFFFF;
+    uint8 index;
+    uint8 bit;
+
+    for(index = 0; index < length; index ++)
+    {
+        crc ^= buffer[index];
+        for(bit = 0; bit < 8; bit ++)
+        {
+            if(crc & 1)
+            {
+                crc = (crc >> 1) ^ 0xA001;
+            }
+            else
+            {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+static void gyro_frame_parse_byte (uint8 data)
+{
+    uint16 crc_calculated;
+    uint16 crc_received;
+
+    switch(gyro_parser_state)
+    {
+        case 0:
+        {
+            if(0x0A == data)
+            {
+                gyro_frame_index = 0;
+                gyro_frame[gyro_frame_index ++] = data;
+                gyro_parser_state = 1;
+            }
+        }break;
+
+        case 1:
+        {
+            if(0x03 == data)
+            {
+                gyro_frame[gyro_frame_index ++] = data;
+                gyro_parser_state = 2;
+            }
+            else
+            {
+                gyro_parser_state = 0;
+            }
+        }break;
+
+        case 2:
+        {
+            if(0x04 == data)
+            {
+                gyro_frame[gyro_frame_index ++] = data;
+                gyro_parser_state = 3;
+            }
+            else
+            {
+                gyro_parser_state = 0;
+            }
+        }break;
+
+        default:
+        {
+            gyro_frame[gyro_frame_index ++] = data;
+            if(GYRO_FRAME_LENGTH <= gyro_frame_index)
+            {
+                crc_calculated = gyro_crc16_calculate(gyro_frame, 7);
+                crc_received = (uint16)gyro_frame[7]
+                             | ((uint16)gyro_frame[8] << 8);
+
+                if(crc_calculated == crc_received)
+                {
+                    gyro_angle_raw = (int16)(((uint16)gyro_frame[3] << 8)
+                                            | gyro_frame[4]);
+                    gyro_data_valid = true;
+                    gyro_new_data = true;
+                }
+                gyro_parser_state = 0;
+            }
+        }break;
+    }
+}
+
+static void gyro_uart_callback (uint32 event, void *ptr)
+{
+    uint8 data;
+
+    (void)ptr;
+    if(UART_INTERRUPT_STATE_RX != event)
+    {
+        return;
+    }
+
+    while(uart_query_byte(GYRO_UART_INDEX, &data))
+    {
+        gyro_frame_parse_byte(data);
+    }
+}
+
+static void gyro_uart_init (void)
+{
+    uart_init(
+        GYRO_UART_INDEX,
+        GYRO_UART_BAUDRATE,
+        GYRO_UART_TX_PIN,
+        GYRO_UART_RX_PIN);
+    uart_set_callback(GYRO_UART_INDEX, gyro_uart_callback, NULL);
+    uart_set_interrupt_config(GYRO_UART_INDEX, UART_INTERRUPT_CONFIG_RX_ENABLE);
+}
+
+static bool gyro_data_get (int16 *angle_raw)
+{
+    uint32 primask;
+    bool updated;
+
+    primask = interrupt_global_disable();
+    *angle_raw = gyro_angle_raw;
+    updated = gyro_new_data;
+    gyro_new_data = false;
+    interrupt_global_enable(primask);
+
+    return updated;
+}
+
+static bool gyro_angle_snapshot_get (int16 *angle_raw)
+{
+    uint32 primask;
+    bool valid;
+
+    primask = interrupt_global_disable();
+    *angle_raw = gyro_angle_raw;
+    valid = gyro_data_valid;
+    interrupt_global_enable(primask);
+
+    return valid;
+}
+
+static int32 gyro_angle_centidegree_get (int16 angle_raw)
+{
+    int32 angle_centidegree;
+
+    // angle_deg = angle_raw / 9.77 = angle_raw * 100 / 977.
+    angle_centidegree = ((int32)angle_raw * 10000) / GYRO_ANGLE_SCALE_X100;
+
+    while(angle_centidegree >= 18000)
+    {
+        angle_centidegree -= 36000;
+    }
+    while(angle_centidegree < -18000)
+    {
+        angle_centidegree += 36000;
+    }
+
+    return angle_centidegree;
+}
+
+static int32 gyro_angle_delta_centidegree_get (int32 current, int32 reference)
+{
+    int32 delta = current - reference;
+
+    while(delta >= 18000)
+    {
+        delta -= 36000;
+    }
+    while(delta < -18000)
+    {
+        delta += 36000;
+    }
+
+    return delta;
+}
+
+static void sharp_turn_gyro_reference_reset (void)
+{
+    int16 gyro_angle;
+
+    sharp_turn_gyro_active = gyro_angle_snapshot_get(&gyro_angle);
+    sharp_turn_gyro_target_reached = false;
+    sharp_turn_angle_centidegree = 0;
+    sharp_turn_start_angle_centidegree = sharp_turn_gyro_active
+        ? gyro_angle_centidegree_get(gyro_angle)
+        : 0;
 }
 
 static int32 speed_feedforward_calculate (int16 target)
@@ -366,20 +1423,75 @@ static bool center_line_is_detected (void)
 
 static void sharp_turn_targets_apply (void)
 {
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ARC_45)
+    int16 inner_speed;
+    int16 outer_speed;
+#else
+    int16 turn_speed;
+#endif
+
+    if(SHARP_TURN_PHASE_ADVANCE == sharp_turn_phase)
+    {
+        left_target_count = SHARP_TURN_ADVANCE_COUNT;
+        right_target_count = SHARP_TURN_ADVANCE_COUNT;
+        track_correction = 0;
+        return;
+    }
+
+    if(sharp_turn_gyro_target_reached)
+    {
+        // 达到目标角度后低速向前，等待中心探头稳定捕获新赛道。
+        left_target_count = SHARP_TURN_EXIT_FORWARD_COUNT;
+        right_target_count = SHARP_TURN_EXIT_FORWARD_COUNT;
+        track_correction = 0;
+        return;
+    }
+
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ARC_45)
+    inner_speed = SHARP_TURN_ARC_INNER_COUNT;
+    outer_speed = SHARP_TURN_ARC_OUTER_COUNT;
+    if(sharp_turn_gyro_active
+    && (sharp_turn_angle_centidegree >= SHARP_TURN_GYRO_SLOW_ANGLE))
+    {
+        inner_speed = SHARP_TURN_ARC_FINE_INNER_COUNT;
+        outer_speed = SHARP_TURN_ARC_FINE_OUTER_COUNT;
+    }
+
     if(TRACK_STATE_TURN_LEFT == track_state)
     {
-        // 左转：物理左轮反转，物理右轮正转。
-        left_target_count = -SHARP_TURN_SPEED_COUNT;
-        right_target_count = SHARP_TURN_SPEED_COUNT;
-        track_correction = -SHARP_TURN_SPEED_COUNT;
+        // 左转时两轮均向前，左内轮慢、右外轮快，形成平滑前进弧线。
+        left_target_count = inner_speed;
+        right_target_count = outer_speed;
+        track_correction = inner_speed - outer_speed;
     }
     else
     {
-        // 右转：物理左轮正转，物理右轮反转。
-        left_target_count = SHARP_TURN_SPEED_COUNT;
-        right_target_count = -SHARP_TURN_SPEED_COUNT;
-        track_correction = SHARP_TURN_SPEED_COUNT;
+        // 右转时两轮均向前，右内轮慢、左外轮快，形成平滑前进弧线。
+        left_target_count = outer_speed;
+        right_target_count = inner_speed;
+        track_correction = outer_speed - inner_speed;
     }
+#else
+    turn_speed = SHARP_TURN_PIVOT_COUNT;
+    if(sharp_turn_gyro_active
+    && (sharp_turn_angle_centidegree >= SHARP_TURN_GYRO_SLOW_ANGLE))
+    {
+        turn_speed = SHARP_TURN_PIVOT_FINE_COUNT;
+    }
+
+    if(TRACK_STATE_TURN_LEFT == track_state)
+    {
+        left_target_count = -turn_speed;
+        right_target_count = turn_speed;
+        track_correction = -turn_speed;
+    }
+    else
+    {
+        left_target_count = turn_speed;
+        right_target_count = -turn_speed;
+        track_correction = turn_speed;
+    }
+#endif
 }
 
 static void sharp_turn_enter (track_state_enum new_state)
@@ -388,14 +1500,36 @@ static void sharp_turn_enter (track_state_enum new_state)
     sharp_candidate_direction = 0;
     sharp_candidate_ticks = 0;
     sharp_turn_ticks = 0;
+    sharp_turn_phase_ticks = 0;
     sharp_reacquire_ticks = 0;
     line_lost_ticks = 0;
     left_speed_pi.integral = 0;
     right_speed_pi.integral = 0;
+    sharp_turn_advance_encoder_count = 0;
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ADVANCE_10CM)
+    sharp_turn_phase = SHARP_TURN_PHASE_ADVANCE;
+#else
+    sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+#endif
+    sharp_turn_gyro_reference_reset();
     sharp_turn_targets_apply();
 
     printf("RIGHT_ANGLE: enter %s turn.\r\n",
         (TRACK_STATE_TURN_LEFT == track_state) ? "LEFT" : "RIGHT");
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ARC_45)
+    printf("RIGHT_ANGLE: scheme 1, slow forward arc to about 45 deg.\r\n");
+#else
+    printf("RIGHT_ANGLE: scheme 2, advance about 10 cm before slow pivot.\r\n");
+#endif
+    if(sharp_turn_gyro_active)
+    {
+        printf("RIGHT_ANGLE: gyro start=%ld centideg.\r\n",
+            (long)sharp_turn_start_angle_centidegree);
+    }
+    else
+    {
+        printf("RIGHT_ANGLE: gyro unavailable, keep line-sensor fallback.\r\n");
+    }
 }
 
 static bool sharp_turn_candidate_update (int16 error)
@@ -444,7 +1578,12 @@ static void track_update (void)
 {
     int16 new_error;
     int16 derivative;
+    int16 gyro_angle;
+    int16 base_target;
     int32 correction;
+    int32 gyro_current_angle;
+    int32 gyro_delta_angle;
+    bool gyro_reacquire_ready;
 
     line_detected = line_error_calculate(&new_error);
 
@@ -453,6 +1592,41 @@ static void track_update (void)
         if(sharp_turn_ticks < 0xFFFF)
         {
             sharp_turn_ticks ++;
+        }
+        if(sharp_turn_phase_ticks < 0xFFFF)
+        {
+            sharp_turn_phase_ticks ++;
+        }
+
+        if((SHARP_TURN_PHASE_ADVANCE == sharp_turn_phase)
+        && (sharp_turn_advance_encoder_count >= SHARP_TURN_ADVANCE_10CM_ENCODER_COUNT))
+        {
+            sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+            sharp_turn_phase_ticks = 0;
+            left_speed_pi.integral = 0;
+            right_speed_pi.integral = 0;
+            sharp_turn_gyro_reference_reset();
+            printf("RIGHT_ANGLE: advance finished at %lu encoder counts, start slow pivot.\r\n",
+                (unsigned long)sharp_turn_advance_encoder_count);
+        }
+
+        if((SHARP_TURN_PHASE_ADVANCE != sharp_turn_phase)
+        && sharp_turn_gyro_active
+        && gyro_angle_snapshot_get(&gyro_angle))
+        {
+            gyro_current_angle = gyro_angle_centidegree_get(gyro_angle);
+            gyro_delta_angle = gyro_angle_delta_centidegree_get(
+                gyro_current_angle,
+                sharp_turn_start_angle_centidegree);
+            sharp_turn_angle_centidegree = (gyro_delta_angle < 0)
+                ? -gyro_delta_angle
+                : gyro_delta_angle;
+
+            if(sharp_turn_angle_centidegree >= SHARP_TURN_GYRO_TARGET_ANGLE)
+            {
+                sharp_turn_gyro_target_reached = true;
+                sharp_turn_phase = SHARP_TURN_PHASE_EXIT;
+            }
         }
 
         if(line_detected)
@@ -466,8 +1640,14 @@ static void track_update (void)
         }
 
         sharp_turn_targets_apply();
+        gyro_reacquire_ready = (SHARP_TURN_PHASE_ADVANCE != sharp_turn_phase)
+            && ((sharp_turn_gyro_active
+              && (sharp_turn_angle_centidegree >= SHARP_TURN_GYRO_REACQUIRE_ANGLE))
+             || (!sharp_turn_gyro_active
+              && (sharp_turn_phase_ticks >= SHARP_TURN_NO_GYRO_MIN_TICKS)));
 
-        if(line_detected
+        if(gyro_reacquire_ready
+        && line_detected
         && center_line_is_detected()
         && !sensors_are_all_black())
         {
@@ -480,13 +1660,21 @@ static void track_update (void)
             {
                 track_state = TRACK_STATE_NORMAL;
                 sharp_turn_ticks = 0;
+                sharp_turn_phase_ticks = 0;
                 sharp_reacquire_ticks = 0;
                 line_lost_ticks = 0;
                 left_speed_pi.integral = 0;
                 right_speed_pi.integral = 0;
                 track_correction = 0;
-                track_targets_set(TRACK_BASE_TARGET_COUNT, 0);
-                printf("RIGHT_ANGLE: center line reacquired, resume normal tracking.\r\n");
+                track_targets_set(TRACK_STRAIGHT_TARGET_COUNT, 0);
+                printf("RIGHT_ANGLE: center line reacquired at %ld centideg, resume normal tracking.\r\n",
+                    (long)sharp_turn_angle_centidegree);
+                sharp_turn_gyro_active = false;
+                sharp_turn_gyro_target_reached = false;
+                sharp_turn_start_angle_centidegree = 0;
+                sharp_turn_angle_centidegree = 0;
+                sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+                sharp_turn_advance_encoder_count = 0;
                 return;
             }
         }
@@ -535,8 +1723,21 @@ static void track_update (void)
             -TRACK_STEER_LIMIT,
             TRACK_STEER_LIMIT);
 
+        if((line_error >= -TRACK_STRAIGHT_ERROR_LIMIT)
+        && (line_error <= TRACK_STRAIGHT_ERROR_LIMIT)
+        && (track_correction >= -TRACK_STRAIGHT_CORRECTION_LIMIT)
+        && (track_correction <= TRACK_STRAIGHT_CORRECTION_LIMIT))
+        {
+            base_target = TRACK_STRAIGHT_TARGET_COUNT;
+        }
+        else
+        {
+            // 偏差或变化率较大时视为弯道，降低平均轮速以保持车体和云台稳定。
+            base_target = TRACK_CURVE_TARGET_COUNT;
+        }
+
         last_line_error = line_error;
-        track_targets_set(TRACK_BASE_TARGET_COUNT, track_correction);
+        track_targets_set(base_target, track_correction);
     }
     else
     {
@@ -654,6 +1855,8 @@ static void speed_control_callback (uint32 event, void *ptr)
 {
     int16 current_left_target;
     int16 current_right_target;
+    int32 left_distance_count;
+    int32 right_distance_count;
 
     (void)event;
     (void)ptr;
@@ -669,6 +1872,22 @@ static void speed_control_callback (uint32 event, void *ptr)
         right_pwm_output = 0;
         motor_stop();
         return;
+    }
+
+    if(SHARP_TURN_PHASE_ADVANCE == sharp_turn_phase)
+    {
+        left_distance_count = left_speed_count;
+        right_distance_count = right_speed_count;
+        if(left_distance_count < 0)
+        {
+            left_distance_count = -left_distance_count;
+        }
+        if(right_distance_count < 0)
+        {
+            right_distance_count = -right_distance_count;
+        }
+        sharp_turn_advance_encoder_count +=
+            (uint32)((left_distance_count + right_distance_count) / 2);
     }
 
     current_left_target = left_target_count;
@@ -713,10 +1932,24 @@ static void car_stop (const char *reason)
     sharp_candidate_direction = 0;
     sharp_candidate_ticks = 0;
     sharp_turn_ticks = 0;
+    sharp_turn_phase_ticks = 0;
     sharp_reacquire_ticks = 0;
+    sharp_turn_gyro_active = false;
+    sharp_turn_gyro_target_reached = false;
+    sharp_turn_start_angle_centidegree = 0;
+    sharp_turn_angle_centidegree = 0;
+    sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+    sharp_turn_advance_encoder_count = 0;
     motor_stop();
 
-    printf("STOP: %s. Motors stopped. Press KEY1 to start again.\r\n", reason);
+    printf("STOP: %s. Motors stopped. Press KEY1 or send S to start again.\r\n", reason);
+
+    if(wireless_ready)
+    {
+        wireless_uart_send_string("STOP: ");
+        wireless_uart_send_string(reason);
+        wireless_uart_send_string("\r\n");
+    }
 }
 
 static bool car_start (void)
@@ -731,7 +1964,14 @@ static bool car_start (void)
     sharp_candidate_direction = 0;
     sharp_candidate_ticks = 0;
     sharp_turn_ticks = 0;
+    sharp_turn_phase_ticks = 0;
     sharp_reacquire_ticks = 0;
+    sharp_turn_gyro_active = false;
+    sharp_turn_gyro_target_reached = false;
+    sharp_turn_start_angle_centidegree = 0;
+    sharp_turn_angle_centidegree = 0;
+    sharp_turn_phase = SHARP_TURN_PHASE_TURN;
+    sharp_turn_advance_encoder_count = 0;
     sharp_turn_timeout_stop = false;
     track_update();
 
@@ -740,7 +1980,11 @@ static bool car_start (void)
         left_target_count = 0;
         right_target_count = 0;
         motor_stop();
-        printf("START ABORTED: no black line detected. Reposition the car and press KEY1.\r\n");
+        printf("START ABORTED: no black line detected. Reposition the car, then press KEY1 or send S.\r\n");
+        if(wireless_ready)
+        {
+            wireless_uart_send_string("START ABORTED: NO LINE\r\n");
+        }
         return false;
     }
 
@@ -764,13 +2008,104 @@ static bool car_start (void)
         left_target_count,
         right_target_count);
 
+    if(wireless_ready)
+    {
+        wireless_uart_send_string("STARTED\r\n");
+    }
+
     return true;
+}
+
+static void wireless_status_send (void)
+{
+    if(!wireless_ready)
+    {
+        return;
+    }
+
+    wireless_uart_send_string(test_running
+        ? "STATUS: RUNNING\r\n"
+        : "STATUS: IDLE\r\n");
+}
+
+static void wireless_command_poll (void)
+{
+    static uint8 receive_buffer[WIRELESS_UART_BUFFER_SIZE];
+    uint32 data_length;
+    uint32 index;
+    uint8 command;
+
+    if(!wireless_ready)
+    {
+        return;
+    }
+
+    data_length = wireless_uart_read_buffer(
+        receive_buffer,
+        WIRELESS_UART_BUFFER_SIZE);
+
+    for(index = 0; index < data_length; index ++)
+    {
+        command = receive_buffer[index];
+
+        switch(command)
+        {
+            case WIRELESS_COMMAND_START:
+            case 's':
+            case '1':
+            {
+                if(test_running)
+                {
+                    wireless_status_send();
+                }
+                else
+                {
+                    car_start();
+                }
+            }break;
+
+            case WIRELESS_COMMAND_STOP:
+            case 'p':
+            case '0':
+            {
+                if(test_running)
+                {
+                    car_stop("wireless stop command");
+                }
+                else
+                {
+                    wireless_status_send();
+                }
+            }break;
+
+            case '?':
+            {
+                wireless_status_send();
+            }break;
+
+            case 'H':
+            case 'h':
+            {
+                wireless_uart_send_string(
+                    "COMMANDS: S/1=START, P/0=STOP, ?=STATUS\r\n");
+            }break;
+
+            default:
+            {
+                // Ignore CR/LF and unknown bytes. Commands are intentionally single-byte.
+            }break;
+        }
+    }
 }
 
 int main (void)
 {
     uint16 print_elapsed_ms = 0;
+    uint16 gyro_print_elapsed_ms = 0;
     key_state_enum key_state;
+    int16 gyro_angle;
+    int32 gyro_angle_centidegree;
+    uint32 gyro_angle_abs_centidegree;
 
     clock_init(SYSTEM_CLOCK_80M);                                               // 时钟配置及系统初始化<务必保留>
 
@@ -788,31 +2123,84 @@ int main (void)
     gs08ra_init();
     gs08ra_set_threshold(GS08RA_BINARY_THRESHOLD);
     key_init(CONTROL_PERIOD_MS);
+	gpio_init(A14, GPO, GPIO_LOW, GPO_PUSH_PULL);
+
+    if(0 == wireless_uart_init())
+    {
+        wireless_ready = true;
+    }
+    else
+    {
+        printf("WARNING: wireless UART init failed; KEY1 control remains available.\r\n");
+    }
+
+    gyro_uart_init();
 
     pit_ms_init(CONTROL_PIT, CONTROL_PERIOD_MS, speed_control_callback, NULL);
     interrupt_global_enable(0);
 
     printf("\r\nGS08RA key-controlled line-follow.\r\n");
-    printf("Physical mapping: LEFT=CH2/TIMG8, RIGHT=CH1/TIMG9.\r\n");
+    printf("Physical mapping: LEFT=CH1/TIMG8, RIGHT=CH2/TIMG9.\r\n");
     printf("KEY1(A30): press once to start, press again to stop.\r\n");
+    printf("Wireless UART1(B5/B6): S/1=start, P/0=stop, ?=status.\r\n");
+    printf("Gyro UART7: B16=RX, B15=TX, 115200. Sensor TX -> B16.\r\n");
     printf("Lost line %d ms -> forced stop.\r\n",
         TRACK_LOST_STOP_TICKS * CONTROL_PERIOD_MS);
-    printf("Right-angle: edge confirm %d ms, pivot speed=%d, timeout=%d ms.\r\n",
+#if (SHARP_TURN_SCHEME == SHARP_TURN_SCHEME_ARC_45)
+    printf("Right-angle scheme 1: forward arc inner=%d, outer=%d count/10ms.\r\n",
+        SHARP_TURN_ARC_INNER_COUNT,
+        SHARP_TURN_ARC_OUTER_COUNT);
+#else
+    printf("Right-angle scheme 2: advance target=%lu counts, speed=%d, pivot=%d.\r\n",
+        (unsigned long)SHARP_TURN_ADVANCE_10CM_ENCODER_COUNT,
+        SHARP_TURN_ADVANCE_COUNT,
+        SHARP_TURN_PIVOT_COUNT);
+#endif
+    printf("Right-angle: edge confirm %d ms, timeout=%d ms.\r\n",
         SHARP_TURN_CONFIRM_TICKS * CONTROL_PERIOD_MS,
-        SHARP_TURN_SPEED_COUNT,
         SHARP_TURN_TIMEOUT_TICKS * CONTROL_PERIOD_MS);
-    printf("Base=%d count/%dms, steering limit=%d, PWM limit=%d.\r\n",
-        TRACK_BASE_TARGET_COUNT,
+    printf("Right-angle gyro: slow=%ld, reacquire=%ld, target=%ld centideg.\r\n",
+        (long)SHARP_TURN_GYRO_SLOW_ANGLE,
+        (long)SHARP_TURN_GYRO_REACQUIRE_ANGLE,
+        (long)SHARP_TURN_GYRO_TARGET_ANGLE);
+    printf("Tracking speed: straight=%d, curve=%d count/%dms, steering limit=%d, PWM limit=%d.\r\n",
+        TRACK_STRAIGHT_TARGET_COUNT,
+        TRACK_CURVE_TARGET_COUNT,
         CONTROL_PERIOD_MS,
         TRACK_STEER_LIMIT,
         PWM_OUTPUT_LIMIT);
-    printf("IDLE: place the car on the black line, then press KEY1.\r\n");
+    printf("IDLE: place the car on the black line, then press KEY1 or send S.\r\n");
+
+    if(wireless_ready)
+    {
+        wireless_uart_send_string("\r\nLINE CAR READY\r\n");
+        wireless_uart_send_string("COMMANDS: S/1=START, P/0=STOP, ?=STATUS\r\n");
+        wireless_status_send();
+    }
 
     while(true)
     {
         system_delay_ms(CONTROL_PERIOD_MS);
+        wireless_command_poll();
         key_scanner();
         key_state = key_get_state(KEY_1);
+
+        gyro_print_elapsed_ms += CONTROL_PERIOD_MS;
+        if(gyro_print_elapsed_ms >= GYRO_PRINT_PERIOD_MS)
+        {
+            gyro_print_elapsed_ms = 0;
+            if(gyro_data_get(&gyro_angle))
+            {
+                gyro_angle_centidegree = gyro_angle_centidegree_get(gyro_angle);
+                gyro_angle_abs_centidegree = (uint32)((gyro_angle_centidegree < 0)
+                    ? -gyro_angle_centidegree
+                    : gyro_angle_centidegree);
+                printf("GYRO angle=%c%lu.%02lu deg\r\n",
+                    (gyro_angle_centidegree < 0) ? '-' : '+',
+                    (unsigned long)(gyro_angle_abs_centidegree / 100),
+                    (unsigned long)(gyro_angle_abs_centidegree % 100));
+            }
+        }
 
         if(KEY_SHORT_PRESS == key_state)
         {
@@ -877,6 +2265,8 @@ int main (void)
     }
 }
 
-#endif
+#endif // MOTOR_ENCODER_MAPPING_TEST
+
+#endif // NEW_MOTOR_SAFE_WIRELESS_TEST
 
 // **************************** 代码区域 ****************************
