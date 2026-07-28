@@ -67,7 +67,8 @@
 
 #define SAFE_TEST_STAGE_OPEN_LOOP        ( 1 )
 #define SAFE_TEST_STAGE_SINGLE_WHEEL_PI  ( 2 )
-#define SAFE_TEST_STAGE                  ( SAFE_TEST_STAGE_SINGLE_WHEEL_PI )
+#define SAFE_TEST_STAGE_LOW_SPEED_TRACK  ( 3 )
+#define SAFE_TEST_STAGE                  ( SAFE_TEST_STAGE_LOW_SPEED_TRACK )
 
 static void safe_test_motors_stop (void)
 {
@@ -351,7 +352,7 @@ int main (void)
     }
 }
 
-#else
+#elif (SAFE_TEST_STAGE == SAFE_TEST_STAGE_SINGLE_WHEEL_PI)
 
 #define SAFE_PI_CONTROL_PIT              ( PIT_TIM_G0 )
 #define SAFE_PI_CONTROL_PERIOD_MS        ( 10 )
@@ -828,6 +829,521 @@ int main (void)
     }
 }
 
+#elif (SAFE_TEST_STAGE == SAFE_TEST_STAGE_LOW_SPEED_TRACK)
+
+// New large-car first line-follow test. Keep this stage intentionally small:
+// GS08RA P steering outside, two independent wheel-speed PI loops inside.
+// No endpoint recognition, gyro or right-angle state machine is enabled here.
+#define SAFE_TRACK_CONTROL_PIT           ( PIT_TIM_G0 )
+#define SAFE_TRACK_CONTROL_PERIOD_MS     ( 10 )
+#define SAFE_TRACK_PRINT_PERIOD_MS       ( 100 )
+#define SAFE_TRACK_LOST_STOP_MS          ( 150 )
+#define SAFE_TRACK_LOST_STOP_TICKS       ( SAFE_TRACK_LOST_STOP_MS / SAFE_TRACK_CONTROL_PERIOD_MS )
+#define SAFE_TRACK_GS08RA_THRESHOLD      ( 30 )
+#define SAFE_TRACK_STRAIGHT_TARGET       ( 8 )
+#define SAFE_TRACK_MILD_CURVE_TARGET     ( 7 )
+#define SAFE_TRACK_CURVE_TARGET          ( 6 )
+#define SAFE_TRACK_LOST_BASE_TARGET      ( 3 )
+#define SAFE_TRACK_STEER_LIMIT           ( 4 )
+#define SAFE_TRACK_TARGET_MAX            ( 10 )
+#define SAFE_TRACK_PD_KP_NUM             ( 2 )
+#define SAFE_TRACK_PD_KD_NUM             ( 1 )
+#define SAFE_TRACK_PD_DIV                ( 2 )
+#define SAFE_TRACK_FEEDFORWARD_STATIC    ( 250 )
+#define SAFE_TRACK_FEEDFORWARD_PER_COUNT ( 105 )
+#define SAFE_TRACK_SPEED_KP              ( 35 )
+#define SAFE_TRACK_SPEED_KI              ( 1 )
+#define SAFE_TRACK_INTEGRAL_LIMIT        ( 500 )
+#define SAFE_TRACK_PWM_LIMIT             ( 2000 )
+
+static volatile int16 safe_track_left_count = 0;
+static volatile int16 safe_track_right_count = 0;
+static volatile int16 safe_track_left_target = 0;
+static volatile int16 safe_track_right_target = 0;
+static volatile int32 safe_track_left_pwm = 0;
+static volatile int32 safe_track_right_pwm = 0;
+static volatile int32 safe_track_left_integral = 0;
+static volatile int32 safe_track_right_integral = 0;
+static volatile bool safe_track_running = false;
+
+static int16 safe_track_error = 0;
+static int16 safe_track_last_error = 0;
+static int16 safe_track_correction = 0;
+static uint16 safe_track_lost_ticks = 0;
+static uint32 safe_track_elapsed_ms = 0;
+static bool safe_track_line_detected = false;
+
+static int32 safe_track_limit (int32 value, int32 minimum, int32 maximum)
+{
+    if(value < minimum)
+    {
+        value = minimum;
+    }
+    else if(value > maximum)
+    {
+        value = maximum;
+    }
+    return value;
+}
+
+static int16 safe_track_base_target_calculate (int16 correction)
+{
+    int16 correction_magnitude;
+
+    correction_magnitude = (correction >= 0) ? correction : -correction;
+    if(0 == correction_magnitude)
+    {
+        return SAFE_TRACK_STRAIGHT_TARGET;
+    }
+    if(1 == correction_magnitude)
+    {
+        return SAFE_TRACK_MILD_CURVE_TARGET;
+    }
+    return SAFE_TRACK_CURVE_TARGET;
+}
+
+static bool safe_track_line_error_calculate (int16 *error)
+{
+    int16 left = -1;
+    int16 right = -1;
+    uint8 index;
+
+    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    {
+        if(0 == gs08ra_bin_val[index])
+        {
+            left = index;
+            break;
+        }
+    }
+
+    for(index = GS08A_CHANNEL_NUM; index > 0; index --)
+    {
+        if(0 == gs08ra_bin_val[index - 1])
+        {
+            right = index - 1;
+            break;
+        }
+    }
+
+    if((left < 0) || (right < 0))
+    {
+        return false;
+    }
+
+    *error = left + right - (GS08A_CHANNEL_NUM - 1);
+    return true;
+}
+
+static int32 safe_track_speed_pi_calculate (
+    int16 target,
+    int16 measured,
+    volatile int32 *integral)
+{
+    int32 error;
+    int32 output;
+
+    if(target <= 0)
+    {
+        *integral = 0;
+        return 0;
+    }
+
+    error = target - measured;
+    *integral = safe_track_limit(
+        *integral + error,
+        -SAFE_TRACK_INTEGRAL_LIMIT,
+        SAFE_TRACK_INTEGRAL_LIMIT);
+
+    output = SAFE_TRACK_FEEDFORWARD_STATIC
+           + SAFE_TRACK_FEEDFORWARD_PER_COUNT * target
+           + SAFE_TRACK_SPEED_KP * error
+           + SAFE_TRACK_SPEED_KI * (*integral);
+
+    return safe_track_limit(output, 0, SAFE_TRACK_PWM_LIMIT);
+}
+
+static void safe_track_control_callback (uint32 event, void *ptr)
+{
+    int16 raw_g8_count;
+    int16 raw_g9_count;
+
+    (void)event;
+    (void)ptr;
+
+    raw_g8_count = encoder_get_count(SAFE_TEST_ENCODER_G8_TIMER);
+    raw_g9_count = encoder_get_count(SAFE_TEST_ENCODER_G9_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+    // New motor mapping: physical LEFT=CH1/TIMG8 (forward raw negative),
+    // physical RIGHT=CH2/TIMG9 (forward raw positive).
+    safe_track_left_count = (int16)(-raw_g8_count);
+    safe_track_right_count = raw_g9_count;
+
+    if(!safe_track_running)
+    {
+        safe_track_left_pwm = 0;
+        safe_track_right_pwm = 0;
+        safe_test_motors_stop();
+        return;
+    }
+
+    safe_track_left_pwm = safe_track_speed_pi_calculate(
+        safe_track_left_target,
+        safe_track_left_count,
+        &safe_track_left_integral);
+    safe_track_right_pwm = safe_track_speed_pi_calculate(
+        safe_track_right_target,
+        safe_track_right_count,
+        &safe_track_right_integral);
+
+    pwm_set_duty(SAFE_TEST_MOTOR_CH1_PWM, (uint16)safe_track_left_pwm);
+    pwm_set_duty(SAFE_TEST_MOTOR_CH2_PWM, (uint16)safe_track_right_pwm);
+}
+
+static void safe_track_stop (const char *reason)
+{
+    safe_track_running = false;
+    safe_track_left_target = 0;
+    safe_track_right_target = 0;
+    safe_track_left_pwm = 0;
+    safe_track_right_pwm = 0;
+    safe_track_left_integral = 0;
+    safe_track_right_integral = 0;
+    safe_test_motors_stop();
+
+    wireless_uart_send_string("STOP: ");
+    wireless_uart_send_string(reason);
+    wireless_uart_send_string("\r\n");
+}
+
+static void safe_track_targets_update (void)
+{
+    int16 derivative;
+    int16 base_target;
+
+    safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
+
+    if(safe_track_line_detected)
+    {
+        safe_track_lost_ticks = 0;
+        derivative = safe_track_error - safe_track_last_error;
+        safe_track_correction = (int16)safe_track_limit(
+            (SAFE_TRACK_PD_KP_NUM * safe_track_error
+                + SAFE_TRACK_PD_KD_NUM * derivative) / SAFE_TRACK_PD_DIV,
+            -SAFE_TRACK_STEER_LIMIT,
+            SAFE_TRACK_STEER_LIMIT);
+        safe_track_last_error = safe_track_error;
+        base_target = safe_track_base_target_calculate(safe_track_correction);
+    }
+    else
+    {
+        safe_track_lost_ticks ++;
+        base_target = SAFE_TRACK_LOST_BASE_TARGET;
+    }
+
+    safe_track_left_target = (int16)safe_track_limit(
+        base_target + safe_track_correction,
+        0,
+        SAFE_TRACK_TARGET_MAX);
+    safe_track_right_target = (int16)safe_track_limit(
+        base_target - safe_track_correction,
+        0,
+        SAFE_TRACK_TARGET_MAX);
+}
+
+static bool safe_track_start (void)
+{
+    safe_test_motors_stop();
+    gs08ra_scan_read();
+    safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
+    if(!safe_track_line_detected)
+    {
+        wireless_uart_send_string("START REFUSED: NO BLACK LINE\r\n");
+        return false;
+    }
+
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+    safe_track_left_count = 0;
+    safe_track_right_count = 0;
+    safe_track_left_pwm = 0;
+    safe_track_right_pwm = 0;
+    safe_track_left_integral = 0;
+    safe_track_right_integral = 0;
+    safe_track_last_error = safe_track_error;
+    safe_track_correction = (int16)safe_track_limit(
+        safe_track_error,
+        -SAFE_TRACK_STEER_LIMIT,
+        SAFE_TRACK_STEER_LIMIT);
+    safe_track_lost_ticks = 0;
+    safe_track_elapsed_ms = 0;
+    safe_track_left_target = safe_track_base_target_calculate(
+        safe_track_correction);
+    safe_track_right_target = safe_track_left_target;
+    safe_track_left_target = (int16)safe_track_limit(
+        safe_track_left_target + safe_track_correction,
+        0,
+        SAFE_TRACK_TARGET_MAX);
+    safe_track_right_target = (int16)safe_track_limit(
+        safe_track_right_target - safe_track_correction,
+        0,
+        SAFE_TRACK_TARGET_MAX);
+    safe_track_running = true;
+    return true;
+}
+
+static void safe_track_gray_snapshot_send (char *send_buffer)
+{
+    int16 gray_error;
+    bool gray_detected;
+
+    safe_test_motors_stop();
+    gs08ra_scan_read();
+    gray_detected = safe_track_line_error_calculate(&gray_error);
+    if(!gray_detected)
+    {
+        gray_error = 99;
+    }
+
+    sprintf(
+        send_buffer,
+        "GRAY BIN=%u%u%u%u%u%u%u%u det=%u err=%d "
+        "RAW=%u,%u,%u,%u,%u,%u,%u,%u "
+        "NORM=%u,%u,%u,%u,%u,%u,%u,%u TH=%u\r\n",
+        gs08ra_bin_val[0],
+        gs08ra_bin_val[1],
+        gs08ra_bin_val[2],
+        gs08ra_bin_val[3],
+        gs08ra_bin_val[4],
+        gs08ra_bin_val[5],
+        gs08ra_bin_val[6],
+        gs08ra_bin_val[7],
+        gray_detected,
+        gray_error,
+        gs08ra_raw_val[0],
+        gs08ra_raw_val[1],
+        gs08ra_raw_val[2],
+        gs08ra_raw_val[3],
+        gs08ra_raw_val[4],
+        gs08ra_raw_val[5],
+        gs08ra_raw_val[6],
+        gs08ra_raw_val[7],
+        gs08ra_deal_val[0],
+        gs08ra_deal_val[1],
+        gs08ra_deal_val[2],
+        gs08ra_deal_val[3],
+        gs08ra_deal_val[4],
+        gs08ra_deal_val[5],
+        gs08ra_deal_val[6],
+        gs08ra_deal_val[7],
+        gs08ra_threshold);
+    wireless_uart_send_string(send_buffer);
+}
+
+int main (void)
+{
+    uint8 receive_buffer[WIRELESS_UART_BUFFER_SIZE];
+    char send_buffer[192];
+    uint32 receive_length;
+    uint32 receive_index;
+    uint16 print_elapsed_ms = 0;
+    uint8 command;
+
+    clock_init(SYSTEM_CLOCK_80M);
+
+    gpio_init(SAFE_TEST_MOTOR_CH1_DIR, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    gpio_init(SAFE_TEST_MOTOR_CH2_DIR, GPO, GPIO_HIGH, GPO_PUSH_PULL);
+    pwm_init(SAFE_TEST_MOTOR_CH1_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    pwm_init(SAFE_TEST_MOTOR_CH2_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    safe_test_motors_stop();
+
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G8_TIMER,
+        SAFE_TEST_ENCODER_G8_A,
+        SAFE_TEST_ENCODER_G8_B);
+    encoder_quad_init(
+        SAFE_TEST_ENCODER_G9_TIMER,
+        SAFE_TEST_ENCODER_G9_A,
+        SAFE_TEST_ENCODER_G9_B);
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+
+    debug_init();
+    system_delay_ms(300);
+
+    gs08ra_init();
+    gs08ra_set_threshold(SAFE_TRACK_GS08RA_THRESHOLD);
+
+    if(wireless_uart_init())
+    {
+        printf("WIRELESS INIT FAILED. Motors remain stopped.\r\n");
+        while(true)
+        {
+            safe_test_motors_stop();
+            system_delay_ms(10);
+        }
+    }
+
+    pit_ms_init(
+        SAFE_TRACK_CONTROL_PIT,
+        SAFE_TRACK_CONTROL_PERIOD_MS,
+        safe_track_control_callback,
+        NULL);
+    interrupt_global_enable(0);
+
+    wireless_uart_send_string("\r\nNEW LARGE-CAR LOW-SPEED LINE TRACK READY\r\n");
+    wireless_uart_send_string("S/1=START, P/0=STOP, G=GRAY SNAPSHOT, ?=STATUS\r\n");
+    wireless_uart_send_string("SPEED: STRAIGHT=8, MILD=7, CURVE=6 count/10ms\r\n");
+    wireless_uart_send_string("STEER_LIMIT=4, NO FIXED TIME LIMIT\r\n");
+    wireless_uart_send_string("LOST LINE 150ms -> FORCED STOP; ALL BLACK IS NOT ENDPOINT\r\n");
+
+    while(true)
+    {
+        receive_length = wireless_uart_read_buffer(
+            receive_buffer,
+            WIRELESS_UART_BUFFER_SIZE);
+
+        for(receive_index = 0; receive_index < receive_length; receive_index ++)
+        {
+            command = receive_buffer[receive_index];
+
+            switch(command)
+            {
+                case 'S':
+                case 's':
+                case '1':
+                {
+                    if(safe_track_running)
+                    {
+                        wireless_uart_send_string("ALREADY RUNNING: SEND 0 TO STOP\r\n");
+                    }
+                    else if(safe_track_start())
+                    {
+                        sprintf(
+                            send_buffer,
+                            "START BIN=%u%u%u%u%u%u%u%u err=%d Ltarget=%d Rtarget=%d\r\n",
+                            gs08ra_bin_val[0],
+                            gs08ra_bin_val[1],
+                            gs08ra_bin_val[2],
+                            gs08ra_bin_val[3],
+                            gs08ra_bin_val[4],
+                            gs08ra_bin_val[5],
+                            gs08ra_bin_val[6],
+                            gs08ra_bin_val[7],
+                            safe_track_error,
+                            safe_track_left_target,
+                            safe_track_right_target);
+                        wireless_uart_send_string(send_buffer);
+                    }
+                }break;
+
+                case 'P':
+                case 'p':
+                case '0':
+                {
+                    safe_track_stop("WIRELESS COMMAND");
+                }break;
+
+                case 'G':
+                case 'g':
+                {
+                    if(safe_track_running)
+                    {
+                        wireless_uart_send_string("BUSY: STOP BEFORE GRAY SNAPSHOT\r\n");
+                    }
+                    else
+                    {
+                        safe_track_gray_snapshot_send(send_buffer);
+                    }
+                }break;
+
+                case '?':
+                {
+                    sprintf(
+                        send_buffer,
+                        "STATUS run=%u t=%lums det=%u err=%d lost=%u "
+                        "L[t=%d c=%d p=%ld] R[t=%d c=%d p=%ld]\r\n",
+                        safe_track_running,
+                        (unsigned long)safe_track_elapsed_ms,
+                        safe_track_line_detected,
+                        safe_track_error,
+                        safe_track_lost_ticks,
+                        safe_track_left_target,
+                        safe_track_left_count,
+                        (long)safe_track_left_pwm,
+                        safe_track_right_target,
+                        safe_track_right_count,
+                        (long)safe_track_right_pwm);
+                    wireless_uart_send_string(send_buffer);
+                }break;
+
+                case 'H':
+                case 'h':
+                {
+                    wireless_uart_send_string(
+                        "S/1=START,P/0=STOP,G=GRAY,?=STATUS; LOST LINE 150ms STOPS\r\n");
+                }break;
+
+                default:
+                {
+                    // Ignore CR, LF and unknown bytes.
+                }break;
+            }
+        }
+
+        if(safe_track_running)
+        {
+            gs08ra_scan_read();
+            safe_track_targets_update();
+            safe_track_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+            print_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+
+            if(safe_track_lost_ticks >= SAFE_TRACK_LOST_STOP_TICKS)
+            {
+                safe_track_stop("LOST LINE 150ms");
+            }
+            else if(print_elapsed_ms >= SAFE_TRACK_PRINT_PERIOD_MS)
+            {
+                print_elapsed_ms = 0;
+                sprintf(
+                    send_buffer,
+                    "TRACK t=%lums BIN=%u%u%u%u%u%u%u%u det=%u err=%d turn=%d lost=%u "
+                    "L[t=%d c=%d p=%ld] R[t=%d c=%d p=%ld]\r\n",
+                    (unsigned long)safe_track_elapsed_ms,
+                    gs08ra_bin_val[0],
+                    gs08ra_bin_val[1],
+                    gs08ra_bin_val[2],
+                    gs08ra_bin_val[3],
+                    gs08ra_bin_val[4],
+                    gs08ra_bin_val[5],
+                    gs08ra_bin_val[6],
+                    gs08ra_bin_val[7],
+                    safe_track_line_detected,
+                    safe_track_error,
+                    safe_track_correction,
+                    safe_track_lost_ticks,
+                    safe_track_left_target,
+                    safe_track_left_count,
+                    (long)safe_track_left_pwm,
+                    safe_track_right_target,
+                    safe_track_right_count,
+                    (long)safe_track_right_pwm);
+                wireless_uart_send_string(send_buffer);
+            }
+        }
+        else
+        {
+            safe_test_motors_stop();
+        }
+
+        system_delay_ms(SAFE_TRACK_CONTROL_PERIOD_MS);
+    }
+}
+
+#else
+#error "Unsupported SAFE_TEST_STAGE"
 #endif // SAFE_TEST_STAGE
 
 #else
