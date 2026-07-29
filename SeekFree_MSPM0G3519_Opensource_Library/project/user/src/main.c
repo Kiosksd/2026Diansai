@@ -840,12 +840,13 @@ int main (void)
 #define SAFE_TRACK_LOST_STOP_MS          ( 150 )
 #define SAFE_TRACK_LOST_STOP_TICKS       ( SAFE_TRACK_LOST_STOP_MS / SAFE_TRACK_CONTROL_PERIOD_MS )
 #define SAFE_TRACK_GS08RA_THRESHOLD      ( 30 )
-#define SAFE_TRACK_STRAIGHT_TARGET       ( 8 )
-#define SAFE_TRACK_MILD_CURVE_TARGET     ( 7 )
-#define SAFE_TRACK_CURVE_TARGET          ( 6 )
-#define SAFE_TRACK_LOST_BASE_TARGET      ( 3 )
-#define SAFE_TRACK_STEER_LIMIT           ( 4 )
-#define SAFE_TRACK_TARGET_MAX            ( 10 )
+#define SAFE_TRACK_STRAIGHT_TARGET       ( 28 )
+#define SAFE_TRACK_MILD_CURVE_TARGET     ( 24 )
+#define SAFE_TRACK_CURVE_TARGET          ( 20 )
+#define SAFE_TRACK_LOST_BASE_TARGET      ( 9 )
+#define SAFE_TRACK_STEER_SCALE           ( 3 )
+#define SAFE_TRACK_STEER_LIMIT           ( 15 )
+#define SAFE_TRACK_TARGET_MAX            ( 35 )
 #define SAFE_TRACK_PD_KP_NUM             ( 2 )
 #define SAFE_TRACK_PD_KD_NUM             ( 1 )
 #define SAFE_TRACK_PD_DIV                ( 2 )
@@ -854,7 +855,13 @@ int main (void)
 #define SAFE_TRACK_SPEED_KP              ( 35 )
 #define SAFE_TRACK_SPEED_KI              ( 1 )
 #define SAFE_TRACK_INTEGRAL_LIMIT        ( 500 )
-#define SAFE_TRACK_PWM_LIMIT             ( 2000 )
+#define SAFE_TRACK_PWM_LIMIT             ( 4500 )
+#define SAFE_TRACK_TARGET_RISE_STEP      ( 1 )
+#define SAFE_TRACK_TARGET_FALL_STEP      ( 2 )
+#define SAFE_TRACK_LAP_TARGET_MS         ( 20000 )
+#define SAFE_TRACK_LAP_MINIMUM_MS        ( 12000 )
+#define SAFE_TRACK_FINISH_BLACK_MIN      ( 4 )
+#define SAFE_TRACK_FINISH_CONFIRM_TICKS  ( 1 )
 
 static volatile int16 safe_track_left_count = 0;
 static volatile int16 safe_track_right_count = 0;
@@ -871,6 +878,9 @@ static int16 safe_track_last_error = 0;
 static int16 safe_track_correction = 0;
 static uint16 safe_track_lost_ticks = 0;
 static uint32 safe_track_elapsed_ms = 0;
+static uint16 safe_track_finish_ticks = 0;
+static uint8 safe_track_black_count = 0;
+static uint8 safe_track_black_peak = 0;
 static bool safe_track_line_detected = false;
 
 static int32 safe_track_limit (int32 value, int32 minimum, int32 maximum)
@@ -900,6 +910,42 @@ static int16 safe_track_base_target_calculate (int16 correction)
         return SAFE_TRACK_MILD_CURVE_TARGET;
     }
     return SAFE_TRACK_CURVE_TARGET;
+}
+
+static int16 safe_track_target_slew (int16 current, int16 desired)
+{
+    if(desired > current)
+    {
+        current += SAFE_TRACK_TARGET_RISE_STEP;
+        if(current > desired)
+        {
+            current = desired;
+        }
+    }
+    else if(desired < current)
+    {
+        current -= SAFE_TRACK_TARGET_FALL_STEP;
+        if(current < desired)
+        {
+            current = desired;
+        }
+    }
+    return current;
+}
+
+static uint8 safe_track_black_count_get (void)
+{
+    uint8 index;
+    uint8 black_count = 0;
+
+    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    {
+        if(0 == gs08ra_bin_val[index])
+        {
+            black_count ++;
+        }
+    }
+    return black_count;
 }
 
 static bool safe_track_line_error_calculate (int16 *error)
@@ -989,6 +1035,11 @@ static void safe_track_control_callback (uint32 event, void *ptr)
         return;
     }
 
+    // Measure lap time from the hardware PIT period. The foreground loop also
+    // scans gray sensors and sends logs, so counting one nominal 10 ms period
+    // per foreground iteration makes the reported lap time run too slowly.
+    safe_track_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+
     safe_track_left_pwm = safe_track_speed_pi_calculate(
         safe_track_left_target,
         safe_track_left_count,
@@ -1022,6 +1073,8 @@ static void safe_track_targets_update (void)
 {
     int16 derivative;
     int16 base_target;
+    int16 desired_left_target;
+    int16 desired_right_target;
 
     safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
 
@@ -1030,8 +1083,9 @@ static void safe_track_targets_update (void)
         safe_track_lost_ticks = 0;
         derivative = safe_track_error - safe_track_last_error;
         safe_track_correction = (int16)safe_track_limit(
-            (SAFE_TRACK_PD_KP_NUM * safe_track_error
-                + SAFE_TRACK_PD_KD_NUM * derivative) / SAFE_TRACK_PD_DIV,
+            SAFE_TRACK_STEER_SCALE
+                * ((SAFE_TRACK_PD_KP_NUM * safe_track_error
+                    + SAFE_TRACK_PD_KD_NUM * derivative) / SAFE_TRACK_PD_DIV),
             -SAFE_TRACK_STEER_LIMIT,
             SAFE_TRACK_STEER_LIMIT);
         safe_track_last_error = safe_track_error;
@@ -1043,14 +1097,21 @@ static void safe_track_targets_update (void)
         base_target = SAFE_TRACK_LOST_BASE_TARGET;
     }
 
-    safe_track_left_target = (int16)safe_track_limit(
+    desired_left_target = (int16)safe_track_limit(
         base_target + safe_track_correction,
         0,
         SAFE_TRACK_TARGET_MAX);
-    safe_track_right_target = (int16)safe_track_limit(
+    desired_right_target = (int16)safe_track_limit(
         base_target - safe_track_correction,
         0,
         SAFE_TRACK_TARGET_MAX);
+
+    safe_track_left_target = safe_track_target_slew(
+        safe_track_left_target,
+        desired_left_target);
+    safe_track_right_target = safe_track_target_slew(
+        safe_track_right_target,
+        desired_right_target);
 }
 
 static bool safe_track_start (void)
@@ -1074,22 +1135,16 @@ static bool safe_track_start (void)
     safe_track_right_integral = 0;
     safe_track_last_error = safe_track_error;
     safe_track_correction = (int16)safe_track_limit(
-        safe_track_error,
+        SAFE_TRACK_STEER_SCALE * safe_track_error,
         -SAFE_TRACK_STEER_LIMIT,
         SAFE_TRACK_STEER_LIMIT);
     safe_track_lost_ticks = 0;
     safe_track_elapsed_ms = 0;
-    safe_track_left_target = safe_track_base_target_calculate(
-        safe_track_correction);
-    safe_track_right_target = safe_track_left_target;
-    safe_track_left_target = (int16)safe_track_limit(
-        safe_track_left_target + safe_track_correction,
-        0,
-        SAFE_TRACK_TARGET_MAX);
-    safe_track_right_target = (int16)safe_track_limit(
-        safe_track_right_target - safe_track_correction,
-        0,
-        SAFE_TRACK_TARGET_MAX);
+    safe_track_finish_ticks = 0;
+    safe_track_black_count = 0;
+    safe_track_black_peak = 0;
+    safe_track_left_target = 0;
+    safe_track_right_target = 0;
     safe_track_running = true;
     return true;
 }
@@ -1148,6 +1203,8 @@ int main (void)
     char send_buffer[192];
     uint32 receive_length;
     uint32 receive_index;
+    uint32 finished_lap_ms;
+    uint32 recommended_scale_x1000;
     uint16 print_elapsed_ms = 0;
     uint8 command;
 
@@ -1195,9 +1252,28 @@ int main (void)
 
     wireless_uart_send_string("\r\nNEW LARGE-CAR LOW-SPEED LINE TRACK READY\r\n");
     wireless_uart_send_string("S/1=START, P/0=STOP, G=GRAY SNAPSHOT, ?=STATUS\r\n");
-    wireless_uart_send_string("SPEED: STRAIGHT=8, MILD=7, CURVE=6 count/10ms\r\n");
-    wireless_uart_send_string("STEER_LIMIT=4, NO FIXED TIME LIMIT\r\n");
-    wireless_uart_send_string("LOST LINE 150ms -> FORCED STOP; ALL BLACK IS NOT ENDPOINT\r\n");
+    sprintf(
+        send_buffer,
+        "SPEED: STRAIGHT=%d, MILD=%d, CURVE=%d count/10ms\r\n",
+        SAFE_TRACK_STRAIGHT_TARGET,
+        SAFE_TRACK_MILD_CURVE_TARGET,
+        SAFE_TRACK_CURVE_TARGET);
+    wireless_uart_send_string(send_buffer);
+    sprintf(
+        send_buffer,
+        "STEER_LIMIT=%d, PWM_LIMIT=%d, NO FIXED TIME LIMIT\r\n",
+        SAFE_TRACK_STEER_LIMIT,
+        SAFE_TRACK_PWM_LIMIT);
+    wireless_uart_send_string(send_buffer);
+    sprintf(
+        send_buffer,
+        "TARGET LAP=%dms; AFTER %dms BLACK_CHANNELS>=%d FOR %dms -> STOP\r\n",
+        SAFE_TRACK_LAP_TARGET_MS,
+        SAFE_TRACK_LAP_MINIMUM_MS,
+        SAFE_TRACK_FINISH_BLACK_MIN,
+        SAFE_TRACK_FINISH_CONFIRM_TICKS * SAFE_TRACK_CONTROL_PERIOD_MS);
+    wireless_uart_send_string(send_buffer);
+    wireless_uart_send_string("LOST LINE 150ms -> FORCED STOP\r\n");
 
     while(true)
     {
@@ -1297,10 +1373,49 @@ int main (void)
         {
             gs08ra_scan_read();
             safe_track_targets_update();
-            safe_track_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
             print_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+            safe_track_black_count = safe_track_black_count_get();
+            if(safe_track_black_count > safe_track_black_peak)
+            {
+                safe_track_black_peak = safe_track_black_count;
+            }
 
-            if(safe_track_lost_ticks >= SAFE_TRACK_LOST_STOP_TICKS)
+            if((safe_track_elapsed_ms >= SAFE_TRACK_LAP_MINIMUM_MS)
+                && (safe_track_black_count >= SAFE_TRACK_FINISH_BLACK_MIN))
+            {
+                safe_track_finish_ticks ++;
+            }
+            else
+            {
+                safe_track_finish_ticks = 0;
+            }
+
+            if(safe_track_finish_ticks >= SAFE_TRACK_FINISH_CONFIRM_TICKS)
+            {
+                finished_lap_ms = safe_track_elapsed_ms;
+                recommended_scale_x1000 =
+                    (finished_lap_ms * 1000UL) / SAFE_TRACK_LAP_TARGET_MS;
+                safe_track_stop("LAP FINISH LINE");
+                sprintf(
+                    send_buffer,
+                    "LAP time=%lums target=%ums black=%u peak=%u scale_x1000=%lu "
+                    "NEXT speed=[%lu,%lu,%lu] steer_limit=%lu\r\n",
+                    (unsigned long)finished_lap_ms,
+                    SAFE_TRACK_LAP_TARGET_MS,
+                    safe_track_black_count,
+                    safe_track_black_peak,
+                    (unsigned long)recommended_scale_x1000,
+                    (unsigned long)((SAFE_TRACK_STRAIGHT_TARGET
+                        * recommended_scale_x1000 + 500UL) / 1000UL),
+                    (unsigned long)((SAFE_TRACK_MILD_CURVE_TARGET
+                        * recommended_scale_x1000 + 500UL) / 1000UL),
+                    (unsigned long)((SAFE_TRACK_CURVE_TARGET
+                        * recommended_scale_x1000 + 500UL) / 1000UL),
+                    (unsigned long)((SAFE_TRACK_STEER_LIMIT
+                        * recommended_scale_x1000 + 500UL) / 1000UL));
+                wireless_uart_send_string(send_buffer);
+            }
+            else if(safe_track_lost_ticks >= SAFE_TRACK_LOST_STOP_TICKS)
             {
                 safe_track_stop("LOST LINE 150ms");
             }
@@ -1309,7 +1424,7 @@ int main (void)
                 print_elapsed_ms = 0;
                 sprintf(
                     send_buffer,
-                    "TRACK t=%lums BIN=%u%u%u%u%u%u%u%u det=%u err=%d turn=%d lost=%u "
+                    "TRACK t=%lums BIN=%u%u%u%u%u%u%u%u black=%u peak=%u det=%u err=%d turn=%d lost=%u finish=%u "
                     "L[t=%d c=%d p=%ld] R[t=%d c=%d p=%ld]\r\n",
                     (unsigned long)safe_track_elapsed_ms,
                     gs08ra_bin_val[0],
@@ -1320,10 +1435,13 @@ int main (void)
                     gs08ra_bin_val[5],
                     gs08ra_bin_val[6],
                     gs08ra_bin_val[7],
+                    safe_track_black_count,
+                    safe_track_black_peak,
                     safe_track_line_detected,
                     safe_track_error,
                     safe_track_correction,
                     safe_track_lost_ticks,
+                    safe_track_finish_ticks,
                     safe_track_left_target,
                     safe_track_left_count,
                     (long)safe_track_left_pwm,
