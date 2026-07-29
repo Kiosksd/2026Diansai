@@ -34,6 +34,7 @@
 ********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
+#include "line_sensor_ir8_uart.h"
 // 打开新的工程或者工程移动了位置务必执行以下操作
 // 第一步 关闭上面所有打开的文件
 // 第二步 project->clean  等待下方进度条走完
@@ -68,7 +69,10 @@
 #define SAFE_TEST_STAGE_OPEN_LOOP        ( 1 )
 #define SAFE_TEST_STAGE_SINGLE_WHEEL_PI  ( 2 )
 #define SAFE_TEST_STAGE_LOW_SPEED_TRACK  ( 3 )
-#define SAFE_TEST_STAGE                  ( SAFE_TEST_STAGE_LOW_SPEED_TRACK )
+#define SAFE_TEST_STAGE_IR8_I2C          ( 4 )
+#define SAFE_TEST_STAGE_IR8_UART         ( 5 )
+#define SAFE_TEST_STAGE_IR8_UART_TRACK   ( 6 )
+#define SAFE_TEST_STAGE                  ( SAFE_TEST_STAGE_IR8_UART_TRACK )
 
 static void safe_test_motors_stop (void)
 {
@@ -829,17 +833,455 @@ int main (void)
     }
 }
 
-#elif (SAFE_TEST_STAGE == SAFE_TEST_STAGE_LOW_SPEED_TRACK)
+#elif (SAFE_TEST_STAGE == SAFE_TEST_STAGE_IR8_UART)
 
-// New large-car first line-follow test. Keep this stage intentionally small:
-// GS08RA P steering outside, two independent wheel-speed PI loops inside.
-// No endpoint recognition, gyro or right-angle state machine is enabled here.
+// Eight-way infrared sensor UART test.
+// Sensor TX -> P8 RX/B16; sensor RX -> P8 TX/B15; 115200 baud, 8N1.
+// The sensor returns: $D,x1:0,x2:0,x3:0,x4:0,x5:0,x6:0,x7:0,x8:0#
+// X1 is stored in bit7 and X8 in bit0; black=0, white=1.
+#define IR8_UART_INDEX                  ( UART_7 )
+#define IR8_UART_BAUDRATE               ( 115200 )
+#define IR8_UART_TX_PIN                 ( UART7_TX_B15 )
+#define IR8_UART_RX_PIN                 ( UART7_RX_B16 )
+#define IR8_UART_FRAME_LENGTH           ( 43 )
+#define IR8_UART_FRAME_BUFFER_SIZE      ( 64 )
+#define IR8_UART_LOOP_PERIOD_MS         ( 10 )
+#define IR8_UART_PRINT_PERIOD_MS        ( 200 )
+#define IR8_UART_RESEND_PERIOD_MS       ( 1000 )
+#define IR8_UART_DIGITAL_COMMAND        ( "$0,0,1#" )
+
+static volatile uint8  ir8_uart_raw_value = 0xFF;
+static volatile uint32 ir8_uart_frame_count = 0;
+static volatile uint32 ir8_uart_rx_byte_count = 0;
+static volatile uint32 ir8_uart_parse_error_count = 0;
+static uint8 ir8_uart_frame_buffer[IR8_UART_FRAME_BUFFER_SIZE];
+static uint8 ir8_uart_frame_length = 0;
+static bool ir8_uart_receiving = false;
+
+static void ir8_uart_parse_byte (uint8 data)
+{
+    uint8 index;
+    uint8 value_position;
+    uint8 raw_value = 0;
+    bool valid = true;
+
+    ir8_uart_rx_byte_count ++;
+
+    if('$' == data)
+    {
+        ir8_uart_receiving = true;
+        ir8_uart_frame_length = 1;
+        ir8_uart_frame_buffer[0] = data;
+        return;
+    }
+
+    if(!ir8_uart_receiving)
+    {
+        return;
+    }
+
+    if(ir8_uart_frame_length >= IR8_UART_FRAME_BUFFER_SIZE)
+    {
+        ir8_uart_receiving = false;
+        ir8_uart_frame_length = 0;
+        ir8_uart_parse_error_count ++;
+        return;
+    }
+
+    ir8_uart_frame_buffer[ir8_uart_frame_length ++] = data;
+    if('#' != data)
+    {
+        return;
+    }
+
+    ir8_uart_receiving = false;
+    if((IR8_UART_FRAME_LENGTH != ir8_uart_frame_length)
+        || ('D' != ir8_uart_frame_buffer[1])
+        || (',' != ir8_uart_frame_buffer[2]))
+    {
+        valid = false;
+    }
+
+    if(valid)
+    {
+        for(index = 0; index < 8; index ++)
+        {
+            value_position = 6 + index * 5;
+            if(('x' != ir8_uart_frame_buffer[value_position - 3])
+                || ((uint8)('1' + index) != ir8_uart_frame_buffer[value_position - 2])
+                || (':' != ir8_uart_frame_buffer[value_position - 1])
+                || (('0' != ir8_uart_frame_buffer[value_position])
+                    && ('1' != ir8_uart_frame_buffer[value_position])))
+            {
+                valid = false;
+                break;
+            }
+
+            if(index < 7)
+            {
+                if(',' != ir8_uart_frame_buffer[value_position + 1])
+                {
+                    valid = false;
+                    break;
+                }
+            }
+            else if('#' != ir8_uart_frame_buffer[value_position + 1])
+            {
+                valid = false;
+                break;
+            }
+
+            raw_value = (uint8)((raw_value << 1)
+                | (ir8_uart_frame_buffer[value_position] - '0'));
+        }
+    }
+
+    if(valid)
+    {
+        ir8_uart_raw_value = raw_value;
+        ir8_uart_frame_count ++;
+    }
+    else
+    {
+        ir8_uart_parse_error_count ++;
+    }
+    ir8_uart_frame_length = 0;
+}
+
+static void ir8_uart_receive_callback (uint32 event, void *ptr)
+{
+    uint8 data;
+
+    (void)ptr;
+    if(UART_INTERRUPT_STATE_RX != event)
+    {
+        return;
+    }
+
+    while(uart_query_byte(IR8_UART_INDEX, &data))
+    {
+        ir8_uart_parse_byte(data);
+    }
+}
+
+static void ir8_uart_test_send (bool wireless_ready, const char *message)
+{
+    printf("%s", message);
+    if(wireless_ready)
+    {
+        wireless_uart_send_string(message);
+    }
+}
+
+int main (void)
+{
+    char send_buffer[192];
+    uint8 raw_value;
+    uint8 black_count;
+    uint8 index;
+    uint16 print_elapsed_ms = 0;
+    uint16 no_frame_elapsed_ms = 0;
+    uint32 frame_count;
+    uint32 last_frame_count = 0;
+    uint32 rx_byte_count;
+    uint32 parse_error_count;
+    uint32 primask;
+    bool wireless_ready;
+
+    clock_init(SYSTEM_CLOCK_80M);
+
+    // Establish a known safe motor state immediately after reset release.
+    gpio_init(SAFE_TEST_MOTOR_CH1_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    gpio_init(SAFE_TEST_MOTOR_CH2_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    pwm_init(SAFE_TEST_MOTOR_CH1_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    pwm_init(SAFE_TEST_MOTOR_CH2_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    safe_test_motors_stop();
+
+    debug_init();
+    uart_init(
+        IR8_UART_INDEX,
+        IR8_UART_BAUDRATE,
+        IR8_UART_TX_PIN,
+        IR8_UART_RX_PIN);
+    uart_set_callback(IR8_UART_INDEX, ir8_uart_receive_callback, NULL);
+    uart_set_interrupt_config(IR8_UART_INDEX, UART_INTERRUPT_CONFIG_RX_ENABLE);
+
+    system_delay_ms(300);
+    wireless_ready = (0 == wireless_uart_init());
+    interrupt_global_enable(0);
+
+    ir8_uart_test_send(wireless_ready, "\r\nIR8 UART DIGITAL TEST READY\r\n");
+    ir8_uart_test_send(wireless_ready, "MOTORS: CH1 PWM=0, CH2 PWM=0\r\n");
+    ir8_uart_test_send(wireless_ready, "P8: SENSOR TX->B16/RX, SENSOR RX->B15/TX, 115200 8N1\r\n");
+    ir8_uart_test_send(wireless_ready, "ORDER: X1 X2 X3 X4 X5 X6 X7 X8; BLACK=0 WHITE=1\r\n");
+    if(!wireless_ready)
+    {
+        printf("WARNING: WIRELESS INIT FAILED; USE DEBUG UART OUTPUT.\r\n");
+    }
+
+    // The module sends no data until this mode command is received.
+    system_delay_ms(700);
+    uart_write_string(IR8_UART_INDEX, IR8_UART_DIGITAL_COMMAND);
+
+    while(true)
+    {
+        safe_test_motors_stop();
+
+        primask = interrupt_global_disable();
+        frame_count = ir8_uart_frame_count;
+        raw_value = ir8_uart_raw_value;
+        rx_byte_count = ir8_uart_rx_byte_count;
+        parse_error_count = ir8_uart_parse_error_count;
+        interrupt_global_enable(primask);
+
+        if(frame_count != last_frame_count)
+        {
+            last_frame_count = frame_count;
+            no_frame_elapsed_ms = 0;
+        }
+        else if(no_frame_elapsed_ms < IR8_UART_RESEND_PERIOD_MS)
+        {
+            no_frame_elapsed_ms += IR8_UART_LOOP_PERIOD_MS;
+        }
+
+        if(no_frame_elapsed_ms >= IR8_UART_RESEND_PERIOD_MS)
+        {
+            uart_write_string(IR8_UART_INDEX, IR8_UART_DIGITAL_COMMAND);
+            no_frame_elapsed_ms = 0;
+        }
+
+        print_elapsed_ms += IR8_UART_LOOP_PERIOD_MS;
+        if(print_elapsed_ms >= IR8_UART_PRINT_PERIOD_MS)
+        {
+            print_elapsed_ms = 0;
+            if(frame_count > 0)
+            {
+                black_count = 0;
+                for(index = 0; index < 8; index ++)
+                {
+                    if(0 == ((raw_value >> (7 - index)) & 0x01))
+                    {
+                        black_count ++;
+                    }
+                }
+
+                sprintf(
+                    send_buffer,
+                    "IR8 UART OK RAW=0x%02X BIN=%u%u%u%u%u%u%u%u BLACK=%u FRAME=%lu RX=%lu ERR=%lu\r\n",
+                    raw_value,
+                    (raw_value >> 7) & 0x01,
+                    (raw_value >> 6) & 0x01,
+                    (raw_value >> 5) & 0x01,
+                    (raw_value >> 4) & 0x01,
+                    (raw_value >> 3) & 0x01,
+                    (raw_value >> 2) & 0x01,
+                    (raw_value >> 1) & 0x01,
+                    raw_value & 0x01,
+                    black_count,
+                    (unsigned long)frame_count,
+                    (unsigned long)rx_byte_count,
+                    (unsigned long)parse_error_count);
+            }
+            else
+            {
+                sprintf(
+                    send_buffer,
+                    "IR8 UART WAIT: NO VALID FRAME RX=%lu ERR=%lu; COMMAND AUTO-RETRY\r\n",
+                    (unsigned long)rx_byte_count,
+                    (unsigned long)parse_error_count);
+            }
+            ir8_uart_test_send(wireless_ready, send_buffer);
+        }
+
+        system_delay_ms(IR8_UART_LOOP_PERIOD_MS);
+    }
+}
+
+#elif (SAFE_TEST_STAGE == SAFE_TEST_STAGE_IR8_I2C)
+
+// Eight-way infrared sensor standalone test.
+// Hardware: P6 SCL=B8, SDA=B26; sensor 7-bit address=0x12.
+// Register 0x30 mapping: bit7=X1 ... bit0=X8; black=0, white=1.
+// Motors are initialized at zero duty and never enabled in this stage.
+#define IR8_I2C_ADDRESS                 ( 0x12 )
+#define IR8_DIGITAL_REGISTER            ( 0x30 )
+#define IR8_SOFT_IIC_DELAY              ( 100 )
+#define IR8_SCL_PIN                     ( B8 )
+#define IR8_SDA_PIN                     ( B26 )
+#define IR8_PRINT_PERIOD_MS             ( 200 )
+
+typedef enum
+{
+    IR8_READ_OK = 0,
+    IR8_READ_NO_ACK_ADDRESS_WRITE,
+    IR8_READ_NO_ACK_REGISTER,
+    IR8_READ_NO_ACK_ADDRESS_READ,
+} ir8_read_status_enum;
+
+static soft_iic_info_struct ir8_iic;
+
+static ir8_read_status_enum ir8_digital_read (uint8 *raw_value)
+{
+    soft_iic_start(&ir8_iic);
+    if(!soft_iic_send_data(&ir8_iic, IR8_I2C_ADDRESS << 1))
+    {
+        soft_iic_stop(&ir8_iic);
+        return IR8_READ_NO_ACK_ADDRESS_WRITE;
+    }
+    if(!soft_iic_send_data(&ir8_iic, IR8_DIGITAL_REGISTER))
+    {
+        soft_iic_stop(&ir8_iic);
+        return IR8_READ_NO_ACK_REGISTER;
+    }
+    soft_iic_stop(&ir8_iic);
+
+    soft_iic_start(&ir8_iic);
+    if(!soft_iic_send_data(&ir8_iic, (IR8_I2C_ADDRESS << 1) | 0x01))
+    {
+        soft_iic_stop(&ir8_iic);
+        return IR8_READ_NO_ACK_ADDRESS_READ;
+    }
+    *raw_value = soft_iic_read_data(&ir8_iic, 1);
+    soft_iic_stop(&ir8_iic);
+    return IR8_READ_OK;
+}
+
+static void ir8_test_send (bool wireless_ready, const char *message)
+{
+    printf("%s", message);
+    if(wireless_ready)
+    {
+        wireless_uart_send_string(message);
+    }
+}
+
+int main (void)
+{
+    char send_buffer[160];
+    uint8 raw_value = 0xFF;
+    uint8 black_count;
+    uint8 index;
+    uint16 failed_reads = 0;
+    bool wireless_ready;
+    ir8_read_status_enum read_status;
+
+    clock_init(SYSTEM_CLOCK_80M);
+
+    // Establish a known safe motor state immediately after reset release.
+    gpio_init(SAFE_TEST_MOTOR_CH1_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    gpio_init(SAFE_TEST_MOTOR_CH2_DIR, GPO, GPIO_LOW, GPO_PUSH_PULL);
+    pwm_init(SAFE_TEST_MOTOR_CH1_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    pwm_init(SAFE_TEST_MOTOR_CH2_PWM, SAFE_TEST_MOTOR_PWM_FREQUENCY, 0);
+    safe_test_motors_stop();
+
+    debug_init();
+    system_delay_ms(300);
+
+    soft_iic_init(
+        &ir8_iic,
+        IR8_I2C_ADDRESS,
+        IR8_SOFT_IIC_DELAY,
+        IR8_SCL_PIN,
+        IR8_SDA_PIN);
+    wireless_ready = (0 == wireless_uart_init());
+    interrupt_global_enable(0);
+
+    ir8_test_send(wireless_ready, "\r\nIR8 I2C DIGITAL TEST READY\r\n");
+    ir8_test_send(wireless_ready, "MOTORS: CH1 PWM=0, CH2 PWM=0\r\n");
+    ir8_test_send(wireless_ready, "P6: SCL=B8 SDA=B26, ADDR=0x12 REG=0x30\r\n");
+    ir8_test_send(wireless_ready, "ORDER: X1 X2 X3 X4 X5 X6 X7 X8; BLACK=0 WHITE=1\r\n");
+    if(!wireless_ready)
+    {
+        printf("WARNING: WIRELESS INIT FAILED; USE DEBUG UART OUTPUT.\r\n");
+    }
+
+    while(true)
+    {
+        safe_test_motors_stop();
+        read_status = ir8_digital_read(&raw_value);
+
+        if(IR8_READ_OK == read_status)
+        {
+            failed_reads = 0;
+            black_count = 0;
+            for(index = 0; index < 8; index ++)
+            {
+                if(0 == ((raw_value >> (7 - index)) & 0x01))
+                {
+                    black_count ++;
+                }
+            }
+
+            sprintf(
+                send_buffer,
+                "IR8 OK RAW=0x%02X BIN=%u%u%u%u%u%u%u%u BLACK=%u\r\n",
+                raw_value,
+                (raw_value >> 7) & 0x01,
+                (raw_value >> 6) & 0x01,
+                (raw_value >> 5) & 0x01,
+                (raw_value >> 4) & 0x01,
+                (raw_value >> 3) & 0x01,
+                (raw_value >> 2) & 0x01,
+                (raw_value >> 1) & 0x01,
+                raw_value & 0x01,
+                black_count);
+        }
+        else
+        {
+            if(failed_reads < 65535)
+            {
+                failed_reads ++;
+            }
+            sprintf(
+                send_buffer,
+                "IR8 I2C_ERROR STEP=%u CONSECUTIVE=%u (NOT SENSOR DATA)\r\n",
+                read_status,
+                failed_reads);
+        }
+
+        ir8_test_send(wireless_ready, send_buffer);
+        system_delay_ms(IR8_PRINT_PERIOD_MS);
+    }
+}
+
+#elif ((SAFE_TEST_STAGE == SAFE_TEST_STAGE_LOW_SPEED_TRACK) \
+    || (SAFE_TEST_STAGE == SAFE_TEST_STAGE_IR8_UART_TRACK))
+
+// One shared controller for both the archived GS08RA sensor and the new IR8
+// UART sensor. Sensor-specific transport is isolated behind safe_track_bin[].
+#if (SAFE_TEST_STAGE == SAFE_TEST_STAGE_IR8_UART_TRACK)
+#define SAFE_TRACK_USE_IR8_UART          ( 1 )
+#else
+#define SAFE_TRACK_USE_IR8_UART          ( 0 )
+#endif
+
 #define SAFE_TRACK_CONTROL_PIT           ( PIT_TIM_G0 )
 #define SAFE_TRACK_CONTROL_PERIOD_MS     ( 10 )
 #define SAFE_TRACK_PRINT_PERIOD_MS       ( 100 )
+#if SAFE_TRACK_USE_IR8_UART
+#define SAFE_TRACK_LOST_CENTER_CORRECTION ( 2 )
+#define SAFE_TRACK_LOST_SIDE_CORRECTION  ( 5 )
+#define SAFE_TRACK_LOST_DITHER_TICKS     ( 100 / SAFE_TRACK_CONTROL_PERIOD_MS )
+#else
 #define SAFE_TRACK_LOST_STOP_MS          ( 150 )
+#define SAFE_TRACK_LOST_STOP_REASON      ( "LOST LINE 150ms" )
 #define SAFE_TRACK_LOST_STOP_TICKS       ( SAFE_TRACK_LOST_STOP_MS / SAFE_TRACK_CONTROL_PERIOD_MS )
+#endif
 #define SAFE_TRACK_GS08RA_THRESHOLD      ( 30 )
+#define SAFE_TRACK_SENSOR_CHANNELS       ( 8 )
+#define SAFE_TRACK_SENSOR_TIMEOUT_MS     ( 100 )
+#define SAFE_TRACK_SENSOR_RETRY_MS       ( 1000 )
+
+#if SAFE_TRACK_USE_IR8_UART
+// Lap-time correction from 37170 ms toward the 20000 ms target.
+#define SAFE_TRACK_STRAIGHT_TARGET       ( 33 )
+#define SAFE_TRACK_MILD_CURVE_TARGET     ( 28 )
+#define SAFE_TRACK_CURVE_TARGET          ( 22 )
+#define SAFE_TRACK_LOST_BASE_TARGET      ( 5 )
+#define SAFE_TRACK_STEER_SCALE           ( 2 )
+#define SAFE_TRACK_STEER_LIMIT           ( 15 )
+#define SAFE_TRACK_TARGET_MAX            ( 40 )
+#else
 #define SAFE_TRACK_STRAIGHT_TARGET       ( 28 )
 #define SAFE_TRACK_MILD_CURVE_TARGET     ( 24 )
 #define SAFE_TRACK_CURVE_TARGET          ( 20 )
@@ -847,6 +1289,8 @@ int main (void)
 #define SAFE_TRACK_STEER_SCALE           ( 3 )
 #define SAFE_TRACK_STEER_LIMIT           ( 15 )
 #define SAFE_TRACK_TARGET_MAX            ( 35 )
+#endif
+
 #define SAFE_TRACK_PD_KP_NUM             ( 2 )
 #define SAFE_TRACK_PD_KD_NUM             ( 1 )
 #define SAFE_TRACK_PD_DIV                ( 2 )
@@ -875,6 +1319,7 @@ static volatile bool safe_track_running = false;
 
 static int16 safe_track_error = 0;
 static int16 safe_track_last_error = 0;
+static int16 safe_track_last_nonzero_error = 0;
 static int16 safe_track_correction = 0;
 static uint16 safe_track_lost_ticks = 0;
 static uint32 safe_track_elapsed_ms = 0;
@@ -882,6 +1327,16 @@ static uint16 safe_track_finish_ticks = 0;
 static uint8 safe_track_black_count = 0;
 static uint8 safe_track_black_peak = 0;
 static bool safe_track_line_detected = false;
+static uint8 safe_track_bin[SAFE_TRACK_SENSOR_CHANNELS] =
+    {1, 1, 1, 1, 1, 1, 1, 1};
+
+#if SAFE_TRACK_USE_IR8_UART
+static volatile uint16 safe_track_sensor_age_ms = SAFE_TRACK_SENSOR_TIMEOUT_MS;
+static uint8 safe_track_sensor_raw = 0xFF;
+static uint32 safe_track_sensor_frame_count = 0;
+static uint32 safe_track_sensor_rx_byte_count = 0;
+static uint32 safe_track_sensor_parse_error_count = 0;
+#endif
 
 static int32 safe_track_limit (int32 value, int32 minimum, int32 maximum)
 {
@@ -933,14 +1388,49 @@ static int16 safe_track_target_slew (int16 current, int16 desired)
     return current;
 }
 
+static bool safe_track_sensor_update (void)
+{
+#if SAFE_TRACK_USE_IR8_UART
+    line_sensor_ir8_uart_snapshot_struct snapshot;
+
+    line_sensor_ir8_uart_snapshot_get(&snapshot);
+    safe_track_sensor_rx_byte_count = snapshot.rx_byte_count;
+    safe_track_sensor_parse_error_count = snapshot.parse_error_count;
+
+    if(0 == snapshot.frame_count)
+    {
+        return false;
+    }
+
+    if(snapshot.frame_count != safe_track_sensor_frame_count)
+    {
+        safe_track_sensor_frame_count = snapshot.frame_count;
+        safe_track_sensor_raw = snapshot.raw;
+        line_sensor_ir8_uart_raw_to_bin(snapshot.raw, safe_track_bin);
+        safe_track_sensor_age_ms = 0;
+        return true;
+    }
+    return false;
+#else
+    uint8 index;
+
+    gs08ra_scan_read();
+    for(index = 0; index < SAFE_TRACK_SENSOR_CHANNELS; index ++)
+    {
+        safe_track_bin[index] = gs08ra_bin_val[index];
+    }
+    return true;
+#endif
+}
+
 static uint8 safe_track_black_count_get (void)
 {
     uint8 index;
     uint8 black_count = 0;
 
-    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    for(index = 0; index < SAFE_TRACK_SENSOR_CHANNELS; index ++)
     {
-        if(0 == gs08ra_bin_val[index])
+        if(0 == safe_track_bin[index])
         {
             black_count ++;
         }
@@ -954,18 +1444,18 @@ static bool safe_track_line_error_calculate (int16 *error)
     int16 right = -1;
     uint8 index;
 
-    for(index = 0; index < GS08A_CHANNEL_NUM; index ++)
+    for(index = 0; index < SAFE_TRACK_SENSOR_CHANNELS; index ++)
     {
-        if(0 == gs08ra_bin_val[index])
+        if(0 == safe_track_bin[index])
         {
             left = index;
             break;
         }
     }
 
-    for(index = GS08A_CHANNEL_NUM; index > 0; index --)
+    for(index = SAFE_TRACK_SENSOR_CHANNELS; index > 0; index --)
     {
-        if(0 == gs08ra_bin_val[index - 1])
+        if(0 == safe_track_bin[index - 1])
         {
             right = index - 1;
             break;
@@ -977,7 +1467,7 @@ static bool safe_track_line_error_calculate (int16 *error)
         return false;
     }
 
-    *error = left + right - (GS08A_CHANNEL_NUM - 1);
+    *error = left + right - (SAFE_TRACK_SENSOR_CHANNELS - 1);
     return true;
 }
 
@@ -1027,6 +1517,16 @@ static void safe_track_control_callback (uint32 event, void *ptr)
     safe_track_left_count = (int16)(-raw_g8_count);
     safe_track_right_count = raw_g9_count;
 
+#if SAFE_TRACK_USE_IR8_UART
+    // Track UART freshness even while stopped, so START can never accept a
+    // stale frame left over from an earlier healthy sensor connection.
+    if(safe_track_sensor_age_ms
+        <= (uint16)(65535 - SAFE_TRACK_CONTROL_PERIOD_MS))
+    {
+        safe_track_sensor_age_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+    }
+#endif
+
     if(!safe_track_running)
     {
         safe_track_left_pwm = 0;
@@ -1075,6 +1575,9 @@ static void safe_track_targets_update (void)
     int16 base_target;
     int16 desired_left_target;
     int16 desired_right_target;
+#if SAFE_TRACK_USE_IR8_UART
+    int16 search_error;
+#endif
 
     safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
 
@@ -1089,12 +1592,54 @@ static void safe_track_targets_update (void)
             -SAFE_TRACK_STEER_LIMIT,
             SAFE_TRACK_STEER_LIMIT);
         safe_track_last_error = safe_track_error;
+        if(0 != safe_track_error)
+        {
+            safe_track_last_nonzero_error = safe_track_error;
+        }
         base_target = safe_track_base_target_calculate(safe_track_correction);
     }
     else
     {
-        safe_track_lost_ticks ++;
+        if(safe_track_lost_ticks < 65535)
+        {
+            safe_track_lost_ticks ++;
+        }
         base_target = SAFE_TRACK_LOST_BASE_TARGET;
+#if SAFE_TRACK_USE_IR8_UART
+        // A digital IR row can report all-white while a narrow line sits in
+        // the gap between two probes. Search toward the last known line side
+        // instead of stopping immediately. With no known side, dither gently.
+        search_error = safe_track_last_error;
+        if(0 == search_error)
+        {
+            search_error = safe_track_last_nonzero_error;
+        }
+
+        if(search_error <= -2)
+        {
+            safe_track_correction = -SAFE_TRACK_LOST_SIDE_CORRECTION;
+        }
+        else if(search_error < 0)
+        {
+            safe_track_correction = -SAFE_TRACK_LOST_CENTER_CORRECTION;
+        }
+        else if(search_error >= 2)
+        {
+            safe_track_correction = SAFE_TRACK_LOST_SIDE_CORRECTION;
+        }
+        else if(search_error > 0)
+        {
+            safe_track_correction = SAFE_TRACK_LOST_CENTER_CORRECTION;
+        }
+        else if(0 == ((safe_track_lost_ticks / SAFE_TRACK_LOST_DITHER_TICKS) & 0x01))
+        {
+            safe_track_correction = -SAFE_TRACK_LOST_CENTER_CORRECTION;
+        }
+        else
+        {
+            safe_track_correction = SAFE_TRACK_LOST_CENTER_CORRECTION;
+        }
+#endif
     }
 
     desired_left_target = (int16)safe_track_limit(
@@ -1117,7 +1662,15 @@ static void safe_track_targets_update (void)
 static bool safe_track_start (void)
 {
     safe_test_motors_stop();
-    gs08ra_scan_read();
+    safe_track_sensor_update();
+#if SAFE_TRACK_USE_IR8_UART
+    if((0 == safe_track_sensor_frame_count)
+        || (safe_track_sensor_age_ms >= SAFE_TRACK_SENSOR_TIMEOUT_MS))
+    {
+        wireless_uart_send_string("START REFUSED: IR8 UART DATA TIMEOUT\r\n");
+        return false;
+    }
+#endif
     safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
     if(!safe_track_line_detected)
     {
@@ -1134,6 +1687,9 @@ static bool safe_track_start (void)
     safe_track_left_integral = 0;
     safe_track_right_integral = 0;
     safe_track_last_error = safe_track_error;
+    safe_track_last_nonzero_error = (0 != safe_track_error)
+        ? safe_track_error
+        : 0;
     safe_track_correction = (int16)safe_track_limit(
         SAFE_TRACK_STEER_SCALE * safe_track_error,
         -SAFE_TRACK_STEER_LIMIT,
@@ -1143,40 +1699,64 @@ static bool safe_track_start (void)
     safe_track_finish_ticks = 0;
     safe_track_black_count = 0;
     safe_track_black_peak = 0;
+#if SAFE_TRACK_USE_IR8_UART
+    safe_track_sensor_age_ms = 0;
+#endif
     safe_track_left_target = 0;
     safe_track_right_target = 0;
     safe_track_running = true;
     return true;
 }
 
-static void safe_track_gray_snapshot_send (char *send_buffer)
+static void safe_track_sensor_snapshot_send (char *send_buffer)
 {
-    int16 gray_error;
-    bool gray_detected;
+    int16 sensor_error;
+    bool sensor_detected;
 
     safe_test_motors_stop();
-    gs08ra_scan_read();
-    gray_detected = safe_track_line_error_calculate(&gray_error);
-    if(!gray_detected)
+    safe_track_sensor_update();
+    sensor_detected = safe_track_line_error_calculate(&sensor_error);
+    if(!sensor_detected)
     {
-        gray_error = 99;
+        sensor_error = 99;
     }
 
+#if SAFE_TRACK_USE_IR8_UART
+    sprintf(
+        send_buffer,
+        "IR8 BIN=%u%u%u%u%u%u%u%u RAW=0x%02X det=%u err=%d "
+        "age=%ums frame=%lu rx=%lu parse_err=%lu\r\n",
+        safe_track_bin[0],
+        safe_track_bin[1],
+        safe_track_bin[2],
+        safe_track_bin[3],
+        safe_track_bin[4],
+        safe_track_bin[5],
+        safe_track_bin[6],
+        safe_track_bin[7],
+        safe_track_sensor_raw,
+        sensor_detected,
+        sensor_error,
+        safe_track_sensor_age_ms,
+        (unsigned long)safe_track_sensor_frame_count,
+        (unsigned long)safe_track_sensor_rx_byte_count,
+        (unsigned long)safe_track_sensor_parse_error_count);
+#else
     sprintf(
         send_buffer,
         "GRAY BIN=%u%u%u%u%u%u%u%u det=%u err=%d "
         "RAW=%u,%u,%u,%u,%u,%u,%u,%u "
         "NORM=%u,%u,%u,%u,%u,%u,%u,%u TH=%u\r\n",
-        gs08ra_bin_val[0],
-        gs08ra_bin_val[1],
-        gs08ra_bin_val[2],
-        gs08ra_bin_val[3],
-        gs08ra_bin_val[4],
-        gs08ra_bin_val[5],
-        gs08ra_bin_val[6],
-        gs08ra_bin_val[7],
-        gray_detected,
-        gray_error,
+        safe_track_bin[0],
+        safe_track_bin[1],
+        safe_track_bin[2],
+        safe_track_bin[3],
+        safe_track_bin[4],
+        safe_track_bin[5],
+        safe_track_bin[6],
+        safe_track_bin[7],
+        sensor_detected,
+        sensor_error,
         gs08ra_raw_val[0],
         gs08ra_raw_val[1],
         gs08ra_raw_val[2],
@@ -1194,6 +1774,7 @@ static void safe_track_gray_snapshot_send (char *send_buffer)
         gs08ra_deal_val[6],
         gs08ra_deal_val[7],
         gs08ra_threshold);
+#endif
     wireless_uart_send_string(send_buffer);
 }
 
@@ -1207,6 +1788,10 @@ int main (void)
     uint32 recommended_scale_x1000;
     uint16 print_elapsed_ms = 0;
     uint8 command;
+#if SAFE_TRACK_USE_IR8_UART
+    uint16 sensor_silence_ms = 0;
+    bool sensor_new_frame;
+#endif
 
     clock_init(SYSTEM_CLOCK_80M);
 
@@ -1230,8 +1815,12 @@ int main (void)
     debug_init();
     system_delay_ms(300);
 
+#if SAFE_TRACK_USE_IR8_UART
+    line_sensor_ir8_uart_init();
+#else
     gs08ra_init();
     gs08ra_set_threshold(SAFE_TRACK_GS08RA_THRESHOLD);
+#endif
 
     if(wireless_uart_init())
     {
@@ -1250,8 +1839,19 @@ int main (void)
         NULL);
     interrupt_global_enable(0);
 
+#if SAFE_TRACK_USE_IR8_UART
+    system_delay_ms(700);
+    line_sensor_ir8_uart_request_data();
+#endif
+
+#if SAFE_TRACK_USE_IR8_UART
+    wireless_uart_send_string("\r\nIR8 UART HALF-SPEED LINE TRACK READY\r\n");
+    wireless_uart_send_string("SENSOR: X1=PHYSICAL LEFT, X8=RIGHT, BLACK=0, WHITE=1\r\n");
+    wireless_uart_send_string("S/1=START, P/0=STOP, G=IR8 SNAPSHOT, ?=STATUS\r\n");
+#else
     wireless_uart_send_string("\r\nNEW LARGE-CAR LOW-SPEED LINE TRACK READY\r\n");
     wireless_uart_send_string("S/1=START, P/0=STOP, G=GRAY SNAPSHOT, ?=STATUS\r\n");
+#endif
     sprintf(
         send_buffer,
         "SPEED: STRAIGHT=%d, MILD=%d, CURVE=%d count/10ms\r\n",
@@ -1273,10 +1873,36 @@ int main (void)
         SAFE_TRACK_FINISH_BLACK_MIN,
         SAFE_TRACK_FINISH_CONFIRM_TICKS * SAFE_TRACK_CONTROL_PERIOD_MS);
     wireless_uart_send_string(send_buffer);
+#if SAFE_TRACK_USE_IR8_UART
+    wireless_uart_send_string(
+        "ALL-WHITE -> CONTINUOUS LOW-SPEED SEARCH; NO LINE-LOSS STOP\r\n");
+    wireless_uart_send_string("IR8 UART DATA TIMEOUT 100ms -> FORCED STOP\r\n");
+#else
     wireless_uart_send_string("LOST LINE 150ms -> FORCED STOP\r\n");
+#endif
 
     while(true)
     {
+#if SAFE_TRACK_USE_IR8_UART
+        sensor_new_frame = safe_track_sensor_update();
+        if(sensor_new_frame)
+        {
+            sensor_silence_ms = 0;
+        }
+        else if(sensor_silence_ms < SAFE_TRACK_SENSOR_RETRY_MS)
+        {
+            sensor_silence_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+        }
+
+        if(sensor_silence_ms >= SAFE_TRACK_SENSOR_RETRY_MS)
+        {
+            line_sensor_ir8_uart_request_data();
+            sensor_silence_ms = 0;
+        }
+#else
+        safe_track_sensor_update();
+#endif
+
         receive_length = wireless_uart_read_buffer(
             receive_buffer,
             WIRELESS_UART_BUFFER_SIZE);
@@ -1300,14 +1926,14 @@ int main (void)
                         sprintf(
                             send_buffer,
                             "START BIN=%u%u%u%u%u%u%u%u err=%d Ltarget=%d Rtarget=%d\r\n",
-                            gs08ra_bin_val[0],
-                            gs08ra_bin_val[1],
-                            gs08ra_bin_val[2],
-                            gs08ra_bin_val[3],
-                            gs08ra_bin_val[4],
-                            gs08ra_bin_val[5],
-                            gs08ra_bin_val[6],
-                            gs08ra_bin_val[7],
+                            safe_track_bin[0],
+                            safe_track_bin[1],
+                            safe_track_bin[2],
+                            safe_track_bin[3],
+                            safe_track_bin[4],
+                            safe_track_bin[5],
+                            safe_track_bin[6],
+                            safe_track_bin[7],
                             safe_track_error,
                             safe_track_left_target,
                             safe_track_right_target);
@@ -1331,7 +1957,7 @@ int main (void)
                     }
                     else
                     {
-                        safe_track_gray_snapshot_send(send_buffer);
+                        safe_track_sensor_snapshot_send(send_buffer);
                     }
                 }break;
 
@@ -1358,8 +1984,13 @@ int main (void)
                 case 'H':
                 case 'h':
                 {
+#if SAFE_TRACK_USE_IR8_UART
+                    wireless_uart_send_string(
+                        "S/1=START,P/0=STOP,G=IR8,?=STATUS; ALL-WHITE SEARCH CONTINUES, UART TIMEOUT 100ms\r\n");
+#else
                     wireless_uart_send_string(
                         "S/1=START,P/0=STOP,G=GRAY,?=STATUS; LOST LINE 150ms STOPS\r\n");
+#endif
                 }break;
 
                 default:
@@ -1371,7 +2002,6 @@ int main (void)
 
         if(safe_track_running)
         {
-            gs08ra_scan_read();
             safe_track_targets_update();
             print_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
             safe_track_black_count = safe_track_black_count_get();
@@ -1390,6 +2020,13 @@ int main (void)
                 safe_track_finish_ticks = 0;
             }
 
+#if SAFE_TRACK_USE_IR8_UART
+            if(safe_track_sensor_age_ms >= SAFE_TRACK_SENSOR_TIMEOUT_MS)
+            {
+                safe_track_stop("IR8 UART DATA TIMEOUT 100ms");
+            }
+            else
+#endif
             if(safe_track_finish_ticks >= SAFE_TRACK_FINISH_CONFIRM_TICKS)
             {
                 finished_lap_ms = safe_track_elapsed_ms;
@@ -1415,10 +2052,12 @@ int main (void)
                         * recommended_scale_x1000 + 500UL) / 1000UL));
                 wireless_uart_send_string(send_buffer);
             }
+#if !SAFE_TRACK_USE_IR8_UART
             else if(safe_track_lost_ticks >= SAFE_TRACK_LOST_STOP_TICKS)
             {
-                safe_track_stop("LOST LINE 150ms");
+                safe_track_stop(SAFE_TRACK_LOST_STOP_REASON);
             }
+#endif
             else if(print_elapsed_ms >= SAFE_TRACK_PRINT_PERIOD_MS)
             {
                 print_elapsed_ms = 0;
@@ -1427,14 +2066,14 @@ int main (void)
                     "TRACK t=%lums BIN=%u%u%u%u%u%u%u%u black=%u peak=%u det=%u err=%d turn=%d lost=%u finish=%u "
                     "L[t=%d c=%d p=%ld] R[t=%d c=%d p=%ld]\r\n",
                     (unsigned long)safe_track_elapsed_ms,
-                    gs08ra_bin_val[0],
-                    gs08ra_bin_val[1],
-                    gs08ra_bin_val[2],
-                    gs08ra_bin_val[3],
-                    gs08ra_bin_val[4],
-                    gs08ra_bin_val[5],
-                    gs08ra_bin_val[6],
-                    gs08ra_bin_val[7],
+                    safe_track_bin[0],
+                    safe_track_bin[1],
+                    safe_track_bin[2],
+                    safe_track_bin[3],
+                    safe_track_bin[4],
+                    safe_track_bin[5],
+                    safe_track_bin[6],
+                    safe_track_bin[7],
                     safe_track_black_count,
                     safe_track_black_peak,
                     safe_track_line_detected,

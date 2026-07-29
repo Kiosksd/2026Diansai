@@ -393,6 +393,16 @@
               <FilePath>..\user\src\main.c</FilePath>
             </File>
             <File>
+              <FileName>line_sensor_ir8_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\user\src\line_sensor_ir8_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>line_sensor_ir8_uart.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\user\inc\line_sensor_ir8_uart.h</FilePath>
+            </File>
+            <File>
               <FileName>isr.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\user\src\isr.c</FilePath>
