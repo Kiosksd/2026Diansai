@@ -1,8 +1,8 @@
-"""MaixCAM2 standalone steel-ball position debugger.
+"""MaixCAM2 steel-ball perception and measurement sender.
 
 This version intentionally has no RTSP/JPEG/WebRTC server.  Ball position and
-velocity are sent to the MSPM0G3507 over a dedicated serial link; the 3507
-firmware only monitors these packets and does not drive the motor from them.
+velocity are sent to the MSPM0G3507 over a dedicated serial link and are used
+by the controller's cascaded position/speed PID.
 """
 
 from maix import app, camera, display, err, image, nn, pinmap, sys, time, uart
@@ -42,7 +42,9 @@ AXIS_END_PX = (551, 124)    # 刻度 +10cm
 AXIS_START_CM = -10.0
 AXIS_ZERO_CM = 0.0
 AXIS_END_CM = 10.0
-TARGET_CM = 0.0
+# This target is used only by the local overlay.  The MSPM0G3507 control target
+# is set independently with the wireless X command (for example X+5 or X0).
+DISPLAY_TARGET_CM = 0.0
 
 # MaixCAM2 right-side B2/B3 pins (UART3) are dedicated to the vision link.
 # The existing wireless
@@ -211,10 +213,10 @@ def calibrated_velocity_from_pixel_velocity(ratio, velocity_x, velocity_y):
         )
     return ratio_per_second * cm_per_ratio
 
-if not min(AXIS_START_CM, AXIS_END_CM) <= TARGET_CM <= max(
+if not min(AXIS_START_CM, AXIS_END_CM) <= DISPLAY_TARGET_CM <= max(
     AXIS_START_CM, AXIS_END_CM
 ):
-    raise ValueError("TARGET_CM must be inside the calibrated range")
+    raise ValueError("DISPLAY_TARGET_CM must be inside the calibrated range")
 
 cam = camera.Camera(input_width, input_height, detector.input_format())
 disp = display.Display()
@@ -248,17 +250,17 @@ def draw_calibration_axis(img):
     img.draw_cross(AXIS_START_PX[0], AXIS_START_PX[1], axis_color, 7, 2)
     img.draw_cross(AXIS_END_PX[0], AXIS_END_PX[1], axis_color, 7, 2)
 
-    target_ratio = calibrated_ratio_from_position(TARGET_CM)
+    target_ratio = calibrated_ratio_from_position(DISPLAY_TARGET_CM)
     target_x, target_y = axis_point(
         target_ratio, AXIS_START_PX, AXIS_END_PX
     )
     img.draw_cross(int(target_x), int(target_y), target_color, 10, 2)
 
 
-print("MaixCAM2 steel-ball standalone debugger")
+print("MaixCAM2 steel-ball perception sender")
 print("network streaming: OFF")
 print("vision link: Maix UART3 B2=TX/B3=RX -> 3507 UART2, 115200 8N1")
-print("vision link mode: monitor only; it cannot command the motor")
+print("vision link mode: position/speed input for MSPM0G3507 cascade PID")
 print("model input: {}x{}".format(input_width, input_height))
 print("axis: {} -> {}".format(AXIS_START_PX, AXIS_END_PX))
 print(
@@ -266,7 +268,7 @@ print(
 )
 print(
     "physical range: {:.2f}cm -> {:.2f}cm, target={:.2f}cm".format(
-        AXIS_START_CM, AXIS_END_CM, TARGET_CM
+        AXIS_START_CM, AXIS_END_CM, DISPLAY_TARGET_CM
     )
 )
 
@@ -322,7 +324,7 @@ while not app.need_exit():
         velocity_cm_s = calibrated_velocity_from_pixel_velocity(
             axis_ratio, position_filter.vx, position_filter.vy
         )
-        position_error_cm = TARGET_CM - position_cm
+        position_error_cm = DISPLAY_TARGET_CM - position_cm
         measurement_valid = True
         projected_x, projected_y = axis_point(
             axis_ratio, AXIS_START_PX, AXIS_END_PX

@@ -1,9 +1,9 @@
-# MaixCAM2 钢珠位置独立调试程序
+# MaixCAM2 钢珠位置与速度测量程序
 
-本版本只用于在 MaixCAM2 上验证钢珠识别、轨道标定和坐标稳定性。
+本程序负责钢珠识别、轨道标定、位置/速度滤波，并向 MSPM0G3507 提供串级 PID 所需的反馈量。
 
 - 不启动 RTSP、JPEG 或 WebRTC 网络图传。
-- MaixCAM2 通过右侧 UART3 向 MSPM0G3507 的 UART2 发送视觉测量值；3507 当前只监测回显，不参与电机控制。
+- MaixCAM2 通过右侧 UART3 向 MSPM0G3507 的 UART2 发送视觉测量值；3507 使用位置和速度进行串级 PID 控制。
 - 识别画面通过 `disp.show(img)` 显示在 MaixCAM2 屏幕；连接 MaixVision 调试时也能看到。
 - 使用 MaixCAM2 的 YOLO26 `640x160` 模型。
 - 使用低延迟单缓冲检测，使检测框与当前输入画面对应。
@@ -18,7 +18,7 @@ AXIS_END_PX = (551, 124)
 AXIS_START_CM = -10.0
 AXIS_ZERO_CM = 0.0
 AXIS_END_CM = 10.0
-TARGET_CM = 0.0
+DISPLAY_TARGET_CM = 0.0
 ```
 
 以上三点来自相机固定后的实测数据：刻度`-10cm`、`0cm`和`+10cm`。
@@ -44,5 +44,6 @@ AA 55 TYPE FLAGS SEQ POS_L POS_H VEL_L VEL_H TIME_L TIME_H CRC8 0D
 `int16` 小端格式，单位为 `0.01cm` 和 `0.01cm/s`。CRC-8 使用多项式
 `0x07`、初值 `0x00`，计算范围为 `TYPE` 到 `TIME_H`。
 
-当前版本中，视觉串口数据不会改变 `s_stepper_target_x100`。上电后电机仍保持禁用，
-只有原有无线命令 `E` 才能手动使能电机。
+上电后电机保持禁用。依次执行 `Z`、`E`、`V` 后，3507 才会启用视觉串级闭环；
+控制目标由无线命令 `X<位置cm>` 设置，例如 `X+5`、`X-5` 或 `X0`。
+`DISPLAY_TARGET_CM` 只影响 MaixCAM2 屏幕上的目标标记，不会改变 3507 的控制目标。
