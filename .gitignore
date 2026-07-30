@@ -1,0 +1,27 @@
+# Keil / ARM build outputs
+MSPM0G3507/project/keil/Objects/
+MSPM0G3507/project/keil/Listings/
+MSPM0G3507/project/keil/build_*.log
+MSPM0G3507/project/keil/*_Sequences_*.log
+MSPM0G3507/project/keil/*.uvguix.*
+
+*.o
+*.obj
+*.d
+*.axf
+*.elf
+*.hex
+*.map
+*.dep
+
+# Python / editor caches
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+
+# Local temporary files
+*.tmp
+*.bak
+*.log
+

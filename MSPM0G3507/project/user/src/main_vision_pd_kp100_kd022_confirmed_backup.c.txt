@@ -1,0 +1,1579 @@
+/*********************************************************************************************************************
+* MSPM0G3507 Opensource Library 即（MSPM0G3507 开源库）是一个基于官方 SDK 接口的第三方开源库
+* Copyright (c) 2022 SEEKFREE 逐飞科技
+* 
+* 本文件是 MSPM0G3507 开源库的一部分
+* 
+* MSPM0G3507 开源库 是免费软件
+* 您可以根据自由软件基金会发布的 GPL（GNU General Public License，即 GNU通用公共许可证）的条款
+* 即 GPL 的第3版（即 GPL3.0）或（您选择的）任何后来的版本，重新发布和/或修改它
+* 
+* 本开源库的发布是希望它能发挥作用，但并未对其作任何的保证
+* 甚至没有隐含的适销性或适合特定用途的保证
+* 更多细节请参见 GPL
+* 
+* 您应该在收到本开源库的同时收到一份 GPL 的副本
+* 如果没有，请参阅<https://www.gnu.org/licenses/>
+* 
+* 额外注明：
+* 本开源库使用 GPL3.0 开源许可证协议 以上许可申明为译文版本
+* 许可申明英文版在 libraries/doc 文件夹下的 GPL3_permission_statement.txt 文件中
+* 许可证副本在 libraries 文件夹下 即该文件夹下的 LICENSE 文件
+* 欢迎各位使用并传播本程序 但修改内容时必须保留逐飞科技的版权声明（即本声明）
+* 
+* 文件名称          mian
+* 公司名称          成都逐飞科技有限公司
+* 版本信息          查看 libraries/doc 文件夹内 version 文件 版本说明
+* 开发环境          MDK 5.37
+* 适用平台          MSPM0G3507
+* 店铺链接          https://seekfree.taobao.com/
+********************************************************************************************************************/
+
+#include "zf_common_headfile.h"
+#include <stdarg.h>
+// 打开新的工程或者工程移动了位置务必执行以下操作
+// 第一步 关闭上面所有打开的文件
+// 第二步 project->clean  等待下方进度条走完
+
+// 本例程是开源库空工程 可用作移植或者测试各类内外设
+// 本例程是开源库空工程 可用作移植或者测试各类内外设
+// 本例程是开源库空工程 可用作移植或者测试各类内外设
+
+// **************************** 用户代码区域 ****************************
+
+// D36A 第一路：B12=STEP、B13=DIR、B8=EN（高电平使能）。
+#define STEPPER_STEP_PIN                     (B12)
+#define STEPPER_DIR_PIN                      (B13)
+#define STEPPER_EN_PIN                       (B8)
+#define STEPPER_STEP_PWM                     (PWM_TIM_A0_CH1_B12)
+#define STEPPER_PWM_CHANNEL_INDEX            (1U)
+#define STEPPER_PWM_CLOCK_HZ                 (1000000U)
+
+// 电机重新安装后的闭环测试参数：32 细分，目标限制在水平零点附近 +/-20 度。
+// 位置误差经 P 控制器转换为 STEP 脉冲频率；本阶段故意限制速度和加速度。
+#define STEPPER_TARGET_LIMIT_X100            (2000)
+#define STEPPER_TEST_TRIP_LIMIT_X100         (2500)
+#define STEPPER_POSITION_DEADBAND_X100       (15)
+#define STEPPER_KP_PPS_PER_DEG               (250U)
+#define STEPPER_MIN_FREQUENCY_PPS            (100U)
+#define STEPPER_MAX_FREQUENCY_PPS            (1000U)
+#define STEPPER_SLEW_PPS_PER_MS              (20)
+
+// 电机重新安装后实测机械极限约为 115.22~213.66 度；保留至少 5 度余量。
+#define STEPPER_ABSOLUTE_MIN_X100            (12100U)
+#define STEPPER_ABSOLUTE_MAX_X100            (20800U)
+#define STEPPER_FEEDBACK_TIMEOUT_LOOPS       (50U)
+
+// 每 50ms 检查一次误差是否反而增大，自动拦截 DIR 极性接反造成的失控。
+#define STEPPER_DIRECTION_CHECK_LOOPS        (50U)
+#define STEPPER_DIRECTION_ERROR_X100         (30U)
+
+// MS42CG 的 PWM 接到 B10；B10 的复用功能 3 是 TIMG8_CCP0。
+#define MS42_PWM_PIN                         (B10)
+#define MS42_PWM_TIMER_LOAD                  (0xFFFFU)
+
+// MT6816 PWM 帧：16 个固定高电平时钟 + 4095 个角度时钟 + 8 个固定低电平时钟。
+#define MS42_PWM_FRAME_CLOCKS                (4119U)
+#define MS42_PWM_HEADER_HIGH_CLOCKS          (16U)
+#define MS42_PWM_ANGLE_COUNTS                (4096U)
+#define MS42_PWM_EDGE_TOLERANCE_CLOCKS       (2U)
+
+#define WIRELESS_DEBUG_BUFFER_SIZE           (192U)
+#define WIRELESS_COMMAND_BUFFER_SIZE         (24U)
+#define WIRELESS_COMMAND_IDLE_LOOPS          (20U)
+#define WIRELESS_STATUS_PERIOD_LOOPS         (100U)
+#define WIRELESS_ACTIVE_STATUS_PERIOD_LOOPS  (500U)
+
+// MaixCAM2 独立使用 UART2：主板串口插座 B15/T=TX、B16/R=RX，115200 8N1。
+// 当前阶段只监测视觉数据，绝不把视觉位置写入电机目标角。
+#define CAMERA_UART_INDEX                    (UART_2)
+#define CAMERA_UART_BAUDRATE                 (115200U)
+#define CAMERA_UART_TX_PIN                   (UART2_TX_B15)
+#define CAMERA_UART_RX_PIN                   (UART2_RX_B16)
+#define CAMERA_FRAME_HEAD_0                  (0xAAU)
+#define CAMERA_FRAME_HEAD_1                  (0x55U)
+#define CAMERA_FRAME_TYPE_BALL               (0x01U)
+#define CAMERA_FRAME_TAIL                    (0x0DU)
+#define CAMERA_FRAME_LENGTH                  (13U)
+#define CAMERA_RX_RING_SIZE                  (128U)
+#define CAMERA_RX_RING_MASK                  (CAMERA_RX_RING_SIZE - 1U)
+#define CAMERA_LINK_TIMEOUT_LOOPS            (300U)
+
+// 视觉外环空运行参数。输出单位为 0.01deg，但本阶段只计算和打印，绝不写入电机目标角。
+// 正位置表示球在中心右侧；实测正电机角会使球向左，因此正位置对应正建议角。
+#define OUTER_DRY_TARGET_POSITION_X100       (0)
+#define OUTER_DRY_KP_X100                    (100)   // 1.00 deg/cm
+#define OUTER_DRY_KD_X100                    (22)    // 0.22 deg/(cm/s)
+#define OUTER_DRY_COMMAND_LIMIT_X100         (1000)  // +/-10.00 deg
+
+// First active vision test: conservative limits and explicit V/M arming.
+#define VISION_TARGET_SLEW_X100_PER_FRAME    (40)    // 0.40deg per camera frame
+#define VISION_POSITION_LIMIT_X100           (1200)  // calibrated useful range +/-12.00cm
+#define VISION_START_POSITION_LIMIT_X100     (1000)  // V accepted only inside +/-10.00cm
+#define VISION_START_ANGLE_LIMIT_X100        (300)   // V accepted only near level (+/-3.00deg)
+#define VISION_BALL_LOST_FRAME_LIMIT         (3U)    // about 60ms at 50Hz UART packets
+#define VISION_REACQUIRE_VALID_FRAMES        (5U)    // about 100ms stable reacquisition
+#define VISION_LINK_TIMEOUT_LOOPS            (120U)  // dedicated-link loss: return level in about 120ms
+
+typedef enum
+{
+    STEPPER_FAULT_NONE = 0,
+    STEPPER_FAULT_ENCODER_LOST,
+    STEPPER_FAULT_ABSOLUTE_LIMIT,
+    STEPPER_FAULT_TEST_RANGE,
+    STEPPER_FAULT_DIRECTION,
+} stepper_fault_enum;
+
+volatile uint32 g_ms42_pwm_high_ticks = 0;
+volatile uint32 g_ms42_pwm_period_ticks = 0;
+volatile uint8  g_ms42_pwm_sample_ready = 0;
+volatile uint8  g_ms42_pwm_synced = 0;
+volatile uint8  g_ms42_pwm_signal_ok = 0;
+
+static uint32 s_ms42_pwm_previous_rise = 0;
+static uint32 s_ms42_pwm_last_fall = 0;
+static uint8  s_ms42_pwm_fall_valid = 0;
+static uint8  s_ms42_pwm_edge_seen = 0;
+
+static uint32 s_encoder_single_x100 = 0;
+static uint32 s_encoder_last_x100 = 0;
+static uint32 s_encoder_high_ticks = 0;
+static uint32 s_encoder_period_ticks = 0;
+static int32  s_encoder_total_x100 = 0;
+static int32  s_encoder_wrap_count = 0;
+static uint32 s_encoder_feedback_age = STEPPER_FEEDBACK_TIMEOUT_LOOPS + 1U;
+static uint8  s_encoder_multiturn_initialized = 0;
+static uint8  s_encoder_feedback_valid = 0;
+
+static int32  s_stepper_target_x100 = 0;
+static int32  s_stepper_frequency_pps = 0;
+static int8   s_stepper_applied_direction = 0;
+static uint8  s_stepper_enabled = 0;
+static uint8  s_stepper_zero_set = 0;
+static uint8  s_stepper_direction_inverted = 0;
+static stepper_fault_enum s_stepper_fault = STEPPER_FAULT_NONE;
+
+static uint8  s_direction_check_active = 0;
+static uint32 s_direction_check_counter = 0;
+static uint32 s_direction_check_reference_error = 0;
+
+static char   s_wireless_command_buffer[WIRELESS_COMMAND_BUFFER_SIZE];
+static uint32 s_wireless_command_length = 0;
+static uint32 s_wireless_command_idle = 0;
+
+static volatile uint8  s_camera_rx_ring[CAMERA_RX_RING_SIZE];
+static volatile uint8  s_camera_rx_head = 0;
+static volatile uint8  s_camera_rx_tail = 0;
+static volatile uint32 s_camera_rx_overflow_count = 0;
+
+static uint8  s_camera_frame_buffer[CAMERA_FRAME_LENGTH];
+static uint8  s_camera_frame_index = 0;
+static uint8  s_camera_sequence = 0;
+static uint8  s_camera_sequence_seen = 0;
+static uint8  s_camera_measurement_valid = 0;
+static int32  s_camera_position_x100 = 0;
+static int32  s_camera_velocity_x100 = 0;
+static uint16 s_camera_capture_ms_low16 = 0;
+static uint32 s_camera_link_age = CAMERA_LINK_TIMEOUT_LOOPS + 1U;
+static uint32 s_camera_valid_frame_count = 0;
+static uint32 s_camera_bad_frame_count = 0;
+static uint32 s_camera_dropped_frame_count = 0;
+
+static int32  s_outer_dry_error_x100 = 0;
+static int32  s_outer_dry_p_term_x100 = 0;
+static int32  s_outer_dry_d_term_x100 = 0;
+static int32  s_outer_dry_command_x100 = 0;
+static uint8  s_outer_dry_valid = 0;
+static uint8  s_outer_dry_saturated = 0;
+
+static uint8  s_vision_control_active = 0;
+static uint8  s_vision_ball_lost = 1;
+static uint8  s_vision_last_sequence = 0;
+static uint8  s_vision_sequence_seen = 0;
+static uint8  s_vision_lost_frame_count = 0;
+static uint8  s_vision_reacquire_count = 0;
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     将格式化调试信息统一通过无线串口模块发送
+// 备注信息     无线模块使用 UART1：B6=MCU_TX，B7=MCU_RX，B2=RTS
+//-------------------------------------------------------------------------------------------------------------------
+static void wireless_debug_printf (const char *format, ...)
+{
+    static char output_buffer[WIRELESS_DEBUG_BUFFER_SIZE];
+    va_list args;
+    int output_length;
+    uint32 send_length;
+
+    va_start(args, format);
+    output_length = vsnprintf(output_buffer, WIRELESS_DEBUG_BUFFER_SIZE, format, args);
+    va_end(args);
+
+    if(output_length <= 0)
+    {
+        return;
+    }
+
+    send_length = (uint32)output_length;
+    if(send_length >= WIRELESS_DEBUG_BUFFER_SIZE)
+    {
+        send_length = WIRELESS_DEBUG_BUFFER_SIZE - 1U;
+    }
+    wireless_uart_send_buffer((const uint8 *)output_buffer, send_length);
+}
+
+static uint32 int32_abs_to_uint32 (int32 value)
+{
+    return (value < 0) ? (uint32)(-value) : (uint32)value;
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     CRC-8，多项式 0x07，初值 0x00
+// 备注信息     与 MaixCAM2 发送端完全一致，用于丢弃串口干扰产生的错误帧
+//-------------------------------------------------------------------------------------------------------------------
+static uint8 camera_crc8_poly07 (const uint8 *data, uint8 length)
+{
+    uint8 crc = 0U;
+    uint8 index;
+    uint8 bit;
+
+    for(index = 0U; index < length; index ++)
+    {
+        crc ^= data[index];
+        for(bit = 0U; bit < 8U; bit ++)
+        {
+            crc = (0U != (crc & 0x80U)) ?
+                (uint8)((crc << 1U) ^ 0x07U) : (uint8)(crc << 1U);
+        }
+    }
+    return crc;
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     UART2 接收中断：只把字节压入环形缓冲区，解析留在主循环完成
+//-------------------------------------------------------------------------------------------------------------------
+static void camera_uart_rx_callback (uint32 state, void *ptr)
+{
+    uint8 data;
+    uint8 next_head;
+
+    (void)ptr;
+    if(UART_INTERRUPT_STATE_RX != state)
+    {
+        return;
+    }
+
+    while(uart_query_byte(CAMERA_UART_INDEX, &data))
+    {
+        next_head = (uint8)((s_camera_rx_head + 1U) & CAMERA_RX_RING_MASK);
+        if(next_head != s_camera_rx_tail)
+        {
+            s_camera_rx_ring[s_camera_rx_head] = data;
+            s_camera_rx_head = next_head;
+        }
+        else
+        {
+            s_camera_rx_overflow_count ++;
+        }
+    }
+}
+
+static uint8 camera_rx_ring_pop (uint8 *data)
+{
+    uint8 local_tail = s_camera_rx_tail;
+
+    if(local_tail == s_camera_rx_head)
+    {
+        return 0U;
+    }
+    *data = s_camera_rx_ring[local_tail];
+    s_camera_rx_tail = (uint8)((local_tail + 1U) & CAMERA_RX_RING_MASK);
+    return 1U;
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     解析 13 字节视觉帧
+// 帧格式       AA 55 01 FLAGS SEQ POS_L POS_H VEL_L VEL_H TIME_L TIME_H CRC 0D
+// 单位         POS/VEL 为有符号整数，分别是 0.01cm、0.01cm/s；FLAGS bit0 表示识别有效
+//-------------------------------------------------------------------------------------------------------------------
+static void camera_accept_byte (uint8 data)
+{
+    uint8 sequence_delta;
+    uint16 raw_value;
+
+    if(0U == s_camera_frame_index)
+    {
+        if(CAMERA_FRAME_HEAD_0 == data)
+        {
+            s_camera_frame_buffer[0] = data;
+            s_camera_frame_index = 1U;
+        }
+        return;
+    }
+
+    if(1U == s_camera_frame_index)
+    {
+        if(CAMERA_FRAME_HEAD_1 == data)
+        {
+            s_camera_frame_buffer[1] = data;
+            s_camera_frame_index = 2U;
+        }
+        else if(CAMERA_FRAME_HEAD_0 != data)
+        {
+            s_camera_frame_index = 0U;
+        }
+        return;
+    }
+
+    s_camera_frame_buffer[s_camera_frame_index] = data;
+    s_camera_frame_index ++;
+    if(s_camera_frame_index < CAMERA_FRAME_LENGTH)
+    {
+        return;
+    }
+    s_camera_frame_index = 0U;
+
+    if((CAMERA_FRAME_TAIL != s_camera_frame_buffer[12]) ||
+       (CAMERA_FRAME_TYPE_BALL != s_camera_frame_buffer[2]) ||
+       (s_camera_frame_buffer[11] !=
+        camera_crc8_poly07(&s_camera_frame_buffer[2], 9U)))
+    {
+        s_camera_bad_frame_count ++;
+        return;
+    }
+
+    if(s_camera_sequence_seen)
+    {
+        sequence_delta = (uint8)(s_camera_frame_buffer[4] - s_camera_sequence);
+        if(sequence_delta > 1U)
+        {
+            s_camera_dropped_frame_count += (uint32)(sequence_delta - 1U);
+        }
+    }
+    s_camera_sequence = s_camera_frame_buffer[4];
+    s_camera_sequence_seen = 1U;
+    s_camera_measurement_valid =
+        (0U != (s_camera_frame_buffer[3] & 0x01U)) ? 1U : 0U;
+
+    raw_value = (uint16)s_camera_frame_buffer[5] |
+        ((uint16)s_camera_frame_buffer[6] << 8U);
+    s_camera_position_x100 = (int32)(int16)raw_value;
+    raw_value = (uint16)s_camera_frame_buffer[7] |
+        ((uint16)s_camera_frame_buffer[8] << 8U);
+    s_camera_velocity_x100 = (int32)(int16)raw_value;
+    s_camera_capture_ms_low16 = (uint16)s_camera_frame_buffer[9] |
+        ((uint16)s_camera_frame_buffer[10] << 8U);
+    s_camera_link_age = 0U;
+    s_camera_valid_frame_count ++;
+}
+
+static void camera_uart_process_received_data (void)
+{
+    uint8 data;
+
+    while(camera_rx_ring_pop(&data))
+    {
+        camera_accept_byte(data);
+    }
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     视觉位置外环 PD 空运行
+// 备注信息     只更新 s_outer_dry_* 监测量，不访问、不修改 s_stepper_target_x100
+//-------------------------------------------------------------------------------------------------------------------
+static void outer_pd_dry_run_update (void)
+{
+    int32 displacement_x100;
+    int32 raw_command_x100;
+
+    if((s_camera_link_age > CAMERA_LINK_TIMEOUT_LOOPS) ||
+       (!s_camera_measurement_valid))
+    {
+        s_outer_dry_error_x100 = 0;
+        s_outer_dry_p_term_x100 = 0;
+        s_outer_dry_d_term_x100 = 0;
+        s_outer_dry_command_x100 = 0;
+        s_outer_dry_valid = 0U;
+        s_outer_dry_saturated = 0U;
+        return;
+    }
+
+    displacement_x100 =
+        s_camera_position_x100 - OUTER_DRY_TARGET_POSITION_X100;
+    s_outer_dry_error_x100 =
+        OUTER_DRY_TARGET_POSITION_X100 - s_camera_position_x100;
+
+    s_outer_dry_p_term_x100 =
+        (displacement_x100 * OUTER_DRY_KP_X100) / 100;
+    s_outer_dry_d_term_x100 =
+        (s_camera_velocity_x100 * OUTER_DRY_KD_X100) / 100;
+    raw_command_x100 =
+        s_outer_dry_p_term_x100 + s_outer_dry_d_term_x100;
+
+    s_outer_dry_saturated = 0U;
+    if(raw_command_x100 > OUTER_DRY_COMMAND_LIMIT_X100)
+    {
+        raw_command_x100 = OUTER_DRY_COMMAND_LIMIT_X100;
+        s_outer_dry_saturated = 1U;
+    }
+    else if(raw_command_x100 < -OUTER_DRY_COMMAND_LIMIT_X100)
+    {
+        raw_command_x100 = -OUTER_DRY_COMMAND_LIMIT_X100;
+        s_outer_dry_saturated = 1U;
+    }
+
+    s_outer_dry_command_x100 = raw_command_x100;
+    s_outer_dry_valid = 1U;
+}
+
+static void camera_uart_init (void)
+{
+    uart_init(CAMERA_UART_INDEX, CAMERA_UART_BAUDRATE,
+        CAMERA_UART_TX_PIN, CAMERA_UART_RX_PIN);
+    uart_set_callback(CAMERA_UART_INDEX, camera_uart_rx_callback, NULL);
+    uart_set_interrupt_config(CAMERA_UART_INDEX,
+        UART_INTERRUPT_CONFIG_RX_ENABLE);
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     初始化 B12 的硬件 PWM，用于向 D36A 输出 STEP 脉冲
+// 备注信息     TIMA0 固定为 1MHz 计数时钟，运行时只修改周期，不占用 CPU 翻转 GPIO
+//-------------------------------------------------------------------------------------------------------------------
+static void stepper_pwm_init (void)
+{
+    pwm_init(STEPPER_STEP_PWM, 1000U, 0U);
+
+    TIMA0->COUNTERREGS.CTRCTL &= ~GPTIMER_CTRCTL_EN_MASK;
+    TIMA0->CLKSEL = GPTIMER_CLKSEL_BUSCLK_SEL_ENABLE;
+    TIMA0->CLKDIV = 7U;                         // 80MHz / 8
+    TIMA0->COMMONREGS.CPS = 9U;                 // 再除以 10，得到 1MHz
+    TIMA0->COUNTERREGS.LOAD = 999U;
+    TIMA0->COUNTERREGS.CC_01[STEPPER_PWM_CHANNEL_INDEX] = 500U;
+    TIMA0->COUNTERREGS.CTR = 0U;
+    TIMA0->COMMONREGS.ODIS |=
+        (GPTIMER_ODIS_C0CCP0_CCP_OUTPUT_LOW << STEPPER_PWM_CHANNEL_INDEX);
+    TIMA0->COUNTERREGS.CTRCTL |= GPTIMER_CTRCTL_EN_ENABLED;
+}
+
+static void stepper_pwm_set_frequency (uint32 frequency_pps)
+{
+    uint32 period_counts;
+    uint32 load_value;
+
+    if(0U == frequency_pps)
+    {
+        TIMA0->COMMONREGS.ODIS |=
+            (GPTIMER_ODIS_C0CCP0_CCP_OUTPUT_LOW << STEPPER_PWM_CHANNEL_INDEX);
+        return;
+    }
+
+    if(frequency_pps > STEPPER_MAX_FREQUENCY_PPS)
+    {
+        frequency_pps = STEPPER_MAX_FREQUENCY_PPS;
+    }
+
+    period_counts = (STEPPER_PWM_CLOCK_HZ + frequency_pps / 2U) / frequency_pps;
+    if(period_counts < 2U)
+    {
+        period_counts = 2U;
+    }
+    load_value = period_counts - 1U;
+
+    TIMA0->COUNTERREGS.LOAD = (uint16)load_value;
+    TIMA0->COUNTERREGS.CC_01[STEPPER_PWM_CHANNEL_INDEX] =
+        (uint16)(period_counts / 2U);
+    TIMA0->COMMONREGS.ODIS &=
+        ~(GPTIMER_ODIS_C0CCP0_CCP_OUTPUT_LOW << STEPPER_PWM_CHANNEL_INDEX);
+}
+
+static void stepper_stop_pulses (void)
+{
+    stepper_pwm_set_frequency(0U);
+    s_stepper_frequency_pps = 0;
+}
+
+static void stepper_apply_signed_frequency (int32 frequency_pps)
+{
+    int8 requested_direction;
+    uint32 absolute_frequency;
+    uint8 dir_level;
+
+    if(0 == frequency_pps)
+    {
+        stepper_stop_pulses();
+        return;
+    }
+
+    requested_direction = (frequency_pps > 0) ? 1 : -1;
+    absolute_frequency = int32_abs_to_uint32(frequency_pps);
+
+    // 改变 DIR 前先保持 STEP 为低至少一个控制周期，满足驱动器方向建立时间。
+    if(requested_direction != s_stepper_applied_direction)
+    {
+        stepper_pwm_set_frequency(0U);
+        dir_level = (requested_direction > 0) ? GPIO_HIGH : GPIO_LOW;
+        if(s_stepper_direction_inverted)
+        {
+            dir_level = (GPIO_HIGH == dir_level) ? GPIO_LOW : GPIO_HIGH;
+        }
+        gpio_set_level(STEPPER_DIR_PIN, dir_level);
+        s_stepper_applied_direction = requested_direction;
+        return;
+    }
+
+    stepper_pwm_set_frequency(absolute_frequency);
+}
+
+static void stepper_disable_output (void)
+{
+    stepper_stop_pulses();
+    gpio_low(STEPPER_EN_PIN);
+    s_stepper_enabled = 0;
+    s_direction_check_active = 0;
+}
+
+static void stepper_trip (stepper_fault_enum fault, const char *message)
+{
+    s_vision_control_active = 0U;
+    s_vision_ball_lost = 1U;
+    stepper_disable_output();
+    s_stepper_fault = fault;
+    wireless_debug_printf("SAFETY STOP: %s\r\n", message);
+}
+
+static void stepper_start_direction_check (void)
+{
+    s_direction_check_active = 1;
+    s_direction_check_counter = 0;
+    s_direction_check_reference_error =
+        int32_abs_to_uint32(s_stepper_target_x100 - s_encoder_total_x100);
+}
+
+static void vision_command_level (uint8 start_direction_check)
+{
+    s_stepper_target_x100 = 0;
+    if(start_direction_check && s_stepper_enabled && s_encoder_feedback_valid)
+    {
+        stepper_start_direction_check();
+    }
+}
+
+static void vision_control_stop_to_level (const char *reason)
+{
+    s_vision_control_active = 0U;
+    s_vision_ball_lost = 1U;
+    s_vision_sequence_seen = 0U;
+    s_vision_lost_frame_count = 0U;
+    s_vision_reacquire_count = 0U;
+    vision_command_level(1U);
+    wireless_debug_printf("VISION SAFE: %s; target=+0.00deg, motor en=%u\r\n",
+        reason, s_stepper_enabled);
+}
+
+static void vision_control_update (void)
+{
+    int32 desired_target_x100;
+    int32 target_delta_x100;
+
+    if(!s_vision_control_active)
+    {
+        return;
+    }
+
+    if(!s_stepper_enabled)
+    {
+        s_vision_control_active = 0U;
+        s_vision_ball_lost = 1U;
+        return;
+    }
+
+    if(s_camera_link_age > VISION_LINK_TIMEOUT_LOOPS)
+    {
+        vision_control_stop_to_level("camera link lost");
+        return;
+    }
+
+    // Apply at most once for each camera packet, not once per 1ms motor loop.
+    if(s_vision_sequence_seen &&
+       (s_camera_sequence == s_vision_last_sequence))
+    {
+        return;
+    }
+    s_vision_last_sequence = s_camera_sequence;
+    s_vision_sequence_seen = 1U;
+
+    if((!s_camera_measurement_valid) ||
+       (int32_abs_to_uint32(s_camera_position_x100) >
+            VISION_POSITION_LIMIT_X100))
+    {
+        s_vision_reacquire_count = 0U;
+        if(s_vision_lost_frame_count < VISION_BALL_LOST_FRAME_LIMIT)
+        {
+            s_vision_lost_frame_count ++;
+        }
+        if((s_vision_lost_frame_count >= VISION_BALL_LOST_FRAME_LIMIT) &&
+           (!s_vision_ball_lost))
+        {
+            s_vision_ball_lost = 1U;
+            vision_command_level(1U);
+            wireless_debug_printf(
+                "VISION BALL LOST: target=+0.00deg, waiting for %u valid frames\r\n",
+                VISION_REACQUIRE_VALID_FRAMES);
+        }
+        return;
+    }
+
+    s_vision_lost_frame_count = 0U;
+    if(s_vision_ball_lost)
+    {
+        vision_command_level(0U);
+        if(s_vision_reacquire_count < VISION_REACQUIRE_VALID_FRAMES)
+        {
+            s_vision_reacquire_count ++;
+        }
+        if(s_vision_reacquire_count < VISION_REACQUIRE_VALID_FRAMES)
+        {
+            return;
+        }
+
+        s_vision_ball_lost = 0U;
+        s_vision_reacquire_count = 0U;
+        s_direction_check_active = 0U;
+        wireless_debug_printf("VISION BALL REACQUIRED: control resumed\r\n");
+    }
+
+    if(!s_outer_dry_valid)
+    {
+        return;
+    }
+
+    desired_target_x100 = s_outer_dry_command_x100;
+    target_delta_x100 = desired_target_x100 - s_stepper_target_x100;
+    if(target_delta_x100 > VISION_TARGET_SLEW_X100_PER_FRAME)
+    {
+        target_delta_x100 = VISION_TARGET_SLEW_X100_PER_FRAME;
+    }
+    else if(target_delta_x100 < -VISION_TARGET_SLEW_X100_PER_FRAME)
+    {
+        target_delta_x100 = -VISION_TARGET_SLEW_X100_PER_FRAME;
+    }
+
+    s_stepper_target_x100 += target_delta_x100;
+    // The target moves every camera frame, so the fixed-target direction test
+    // is not applicable here. Encoder, absolute and relative limits stay active.
+    s_direction_check_active = 0U;
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     约 1ms 调用一次的电机角度内环
+// 备注信息     P 控制输出为带符号 STEP 频率，并进行斜坡、限位及方向错误检测
+//-------------------------------------------------------------------------------------------------------------------
+static void stepper_control_update (void)
+{
+    int32 error_x100;
+    int32 desired_frequency;
+    int32 next_frequency;
+    uint32 absolute_error;
+    uint32 frequency_magnitude;
+
+    if(!s_stepper_enabled)
+    {
+        stepper_stop_pulses();
+        return;
+    }
+
+    if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok) ||
+       (s_encoder_feedback_age > STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+    {
+        stepper_trip(STEPPER_FAULT_ENCODER_LOST, "encoder PWM lost");
+        return;
+    }
+
+    if((s_encoder_single_x100 <= STEPPER_ABSOLUTE_MIN_X100) ||
+       (s_encoder_single_x100 >= STEPPER_ABSOLUTE_MAX_X100))
+    {
+        stepper_trip(STEPPER_FAULT_ABSOLUTE_LIMIT, "absolute angle limit");
+        return;
+    }
+
+    if(int32_abs_to_uint32(s_encoder_total_x100) > STEPPER_TEST_TRIP_LIMIT_X100)
+    {
+        stepper_trip(STEPPER_FAULT_TEST_RANGE, "initial-test +/-10deg range");
+        return;
+    }
+
+    error_x100 = s_stepper_target_x100 - s_encoder_total_x100;
+    absolute_error = int32_abs_to_uint32(error_x100);
+    desired_frequency = 0;
+
+    if(absolute_error > STEPPER_POSITION_DEADBAND_X100)
+    {
+        frequency_magnitude =
+            (absolute_error * STEPPER_KP_PPS_PER_DEG) / 100U;
+        if(frequency_magnitude < STEPPER_MIN_FREQUENCY_PPS)
+        {
+            frequency_magnitude = STEPPER_MIN_FREQUENCY_PPS;
+        }
+        if(frequency_magnitude > STEPPER_MAX_FREQUENCY_PPS)
+        {
+            frequency_magnitude = STEPPER_MAX_FREQUENCY_PPS;
+        }
+        desired_frequency = (error_x100 > 0) ?
+            (int32)frequency_magnitude : -(int32)frequency_magnitude;
+    }
+
+    next_frequency = s_stepper_frequency_pps;
+
+    // 反向时先减速到零，下一个周期再改变 DIR。
+    if(((next_frequency > 0) && (desired_frequency < 0)) ||
+       ((next_frequency < 0) && (desired_frequency > 0)))
+    {
+        desired_frequency = 0;
+    }
+
+    if(next_frequency < desired_frequency)
+    {
+        next_frequency += STEPPER_SLEW_PPS_PER_MS;
+        if(next_frequency > desired_frequency)
+        {
+            next_frequency = desired_frequency;
+        }
+    }
+    else if(next_frequency > desired_frequency)
+    {
+        next_frequency -= STEPPER_SLEW_PPS_PER_MS;
+        if(next_frequency < desired_frequency)
+        {
+            next_frequency = desired_frequency;
+        }
+    }
+
+    s_stepper_frequency_pps = next_frequency;
+    stepper_apply_signed_frequency(next_frequency);
+
+    if(s_direction_check_active && (0 != next_frequency))
+    {
+        s_direction_check_counter ++;
+        if(s_direction_check_counter >= STEPPER_DIRECTION_CHECK_LOOPS)
+        {
+            if(absolute_error >
+               (s_direction_check_reference_error + STEPPER_DIRECTION_ERROR_X100))
+            {
+                stepper_trip(STEPPER_FAULT_DIRECTION,
+                    "angle moved away from target; send I while disabled");
+                return;
+            }
+
+            s_direction_check_counter = 0;
+            s_direction_check_reference_error = absolute_error;
+            if(absolute_error <= (STEPPER_POSITION_DEADBAND_X100 + 10U))
+            {
+                s_direction_check_active = 0;
+            }
+        }
+    }
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     初始化 TIMG8，硬件同时捕获 PWM 高电平宽度和整周期
+// 备注信息     TIMG8 使用 40MHz BUSCLK，2 分频后计数频率为 20MHz
+//-------------------------------------------------------------------------------------------------------------------
+static void ms42_pwm_capture_init (void)
+{
+    static const DL_Timer_ClockConfig clock_config =
+    {
+        .clockSel = DL_TIMER_CLOCK_BUSCLK,
+        .divideRatio = DL_TIMER_CLOCK_DIVIDE_1,
+        .prescale = 1U,
+    };
+    static const DL_Timer_CaptureCombinedConfig capture_config =
+    {
+        .captureMode = DL_TIMER_CAPTURE_COMBINED_MODE_PULSE_WIDTH_AND_PERIOD,
+        .period = MS42_PWM_TIMER_LOAD,
+        .startTimer = DL_TIMER_STOP,
+        .inputChan = DL_TIMER_INPUT_CHAN_0,
+        .inputInvMode = DL_TIMER_CC_INPUT_INV_NOINVERT,
+    };
+
+    // PWM 是编码器推挽输出，因此输入端不使用内部上拉或下拉。
+    afio_init(MS42_PWM_PIN, GPI, GPIO_AF3, GPI_FLOATING_IN);
+
+    timer_clock_enable(TIM_G8);
+    DL_TimerG_setClockConfig(TIMG8, &clock_config);
+    DL_TimerG_initCaptureCombinedMode(TIMG8, &capture_config);
+    DL_TimerG_setCoreHaltBehavior(TIMG8, DL_TIMER_CORE_HALT_IMMEDIATE);
+
+    // CC0 捕获下降沿，CC1 捕获上升沿；ZERO 用来判断 PWM 信号丢失。
+    DL_TimerG_clearInterruptStatus(TIMG8, TIMG8->CPU_INT.RIS);
+    DL_TimerG_enableInterrupt(TIMG8,
+        DL_TIMERG_INTERRUPT_CC0_DN_EVENT |
+        DL_TIMERG_INTERRUPT_CC1_DN_EVENT |
+        DL_TIMERG_INTERRUPT_ZERO_EVENT);
+    interrupt_set_priority(TIMG8_INT_IRQn, 1);
+    interrupt_enable(TIMG8_INT_IRQn);
+    DL_TimerG_startCounter(TIMG8);
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     TIMG8 中断的应用层处理函数，由 isr.c 调用
+// 备注信息     使用连续时间戳作差，不在上升沿中断中重装计数器
+//-------------------------------------------------------------------------------------------------------------------
+void ms42_pwm_capture_irq_handler (void)
+{
+    uint32 current_rise;
+
+    switch(DL_TimerG_getPendingInterrupt(TIMG8))
+    {
+        case DL_TIMERG_IIDX_CC0_DN:
+        {
+            s_ms42_pwm_last_fall =
+                DL_TimerG_getCaptureCompareValue(TIMG8, DL_TIMER_CC_0_INDEX);
+            s_ms42_pwm_fall_valid = 1;
+            s_ms42_pwm_edge_seen = 1;
+        }break;
+
+        case DL_TIMERG_IIDX_CC1_DN:
+        {
+            current_rise =
+                DL_TimerG_getCaptureCompareValue(TIMG8, DL_TIMER_CC_1_INDEX);
+            s_ms42_pwm_edge_seen = 1;
+
+            if(g_ms42_pwm_synced && s_ms42_pwm_fall_valid)
+            {
+                // TIMG8 向下计数，减法后取低 16 位即可自动处理计数器回绕。
+                g_ms42_pwm_period_ticks =
+                    (s_ms42_pwm_previous_rise - current_rise) & MS42_PWM_TIMER_LOAD;
+                g_ms42_pwm_high_ticks =
+                    (s_ms42_pwm_previous_rise - s_ms42_pwm_last_fall) & MS42_PWM_TIMER_LOAD;
+                g_ms42_pwm_sample_ready = 1;
+                g_ms42_pwm_signal_ok = 1;
+            }
+
+            s_ms42_pwm_previous_rise = current_rise;
+            s_ms42_pwm_fall_valid = 0;
+            g_ms42_pwm_synced = 1;
+        }break;
+
+        case DL_TIMERG_IIDX_ZERO:
+        {
+            // 一个完整的 16 位计数周期内都没有边沿，才判定 PWM 已断开。
+            if(!s_ms42_pwm_edge_seen)
+            {
+                g_ms42_pwm_synced = 0;
+                g_ms42_pwm_signal_ok = 0;
+                s_ms42_pwm_fall_valid = 0;
+            }
+            s_ms42_pwm_edge_seen = 0;
+        }break;
+
+        default: break;
+    }
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// 函数简介     将捕获值换算为 0~35999，即角度的 0.01 度单位
+// 返回参数     1=数据有效，0=帧格式不合理
+//-------------------------------------------------------------------------------------------------------------------
+static uint8 ms42_pwm_get_angle_x100 (
+    uint32 high_ticks, uint32 period_ticks, uint32 *angle_x100)
+{
+    uint32 high_clocks;
+    uint32 angle_count;
+    const uint32 minimum_high_clocks = MS42_PWM_HEADER_HIGH_CLOCKS;
+    const uint32 maximum_high_clocks =
+        MS42_PWM_HEADER_HIGH_CLOCKS + MS42_PWM_ANGLE_COUNTS - 1U;
+
+    if((0U == period_ticks) || (high_ticks >= period_ticks))
+    {
+        return 0;
+    }
+
+    // 用实测周期归一化，因此兼容 MT6816 的 971.1Hz 和 485.6Hz 两种 PWM 频率。
+    high_clocks = (uint32)(((uint64)high_ticks * MS42_PWM_FRAME_CLOCKS +
+        period_ticks / 2U) / period_ticks);
+    // 输入同步和整数计数可能在边界产生约 1 个时钟的抖动。
+    // 仅对固定帧头/帧尾附近给出小容差，明显错误的脉宽仍然会被拒绝。
+    if(((high_clocks + MS42_PWM_EDGE_TOLERANCE_CLOCKS) < minimum_high_clocks) ||
+        (high_clocks > (maximum_high_clocks + MS42_PWM_EDGE_TOLERANCE_CLOCKS)))
+    {
+        return 0;
+    }
+
+    if(high_clocks < minimum_high_clocks)
+    {
+        high_clocks = minimum_high_clocks;
+    }
+    else if(high_clocks > maximum_high_clocks)
+    {
+        high_clocks = maximum_high_clocks;
+    }
+
+    angle_count = high_clocks - MS42_PWM_HEADER_HIGH_CLOCKS;
+    *angle_x100 = (uint32)(((uint64)angle_count * 36000U +
+        MS42_PWM_ANGLE_COUNTS / 2U) / MS42_PWM_ANGLE_COUNTS);
+    return 1;
+}
+
+static uint8 ms42_process_sample (uint32 high_ticks, uint32 period_ticks)
+{
+    uint32 angle_x100;
+    int32 raw_delta_x100;
+    int32 delta_x100;
+
+    if(!ms42_pwm_get_angle_x100(high_ticks, period_ticks, &angle_x100))
+    {
+        return 0;
+    }
+
+    s_encoder_high_ticks = high_ticks;
+    s_encoder_period_ticks = period_ticks;
+    s_encoder_single_x100 = angle_x100;
+
+    if(!s_encoder_multiturn_initialized)
+    {
+        s_encoder_last_x100 = angle_x100;
+        s_encoder_multiturn_initialized = 1;
+    }
+    else
+    {
+        raw_delta_x100 = (int32)angle_x100 - (int32)s_encoder_last_x100;
+        delta_x100 = raw_delta_x100;
+
+        if(raw_delta_x100 > 18000)
+        {
+            delta_x100 -= 36000;
+            s_encoder_wrap_count --;
+        }
+        else if(raw_delta_x100 < -18000)
+        {
+            delta_x100 += 36000;
+            s_encoder_wrap_count ++;
+        }
+
+        s_encoder_total_x100 += delta_x100;
+        s_encoder_last_x100 = angle_x100;
+    }
+
+    s_encoder_feedback_valid = 1;
+    s_encoder_feedback_age = 0;
+    return 1;
+}
+
+static uint8 parse_target_angle_x100 (const char *text, int32 *target_x100)
+{
+    uint32 index = 0;
+    uint32 whole = 0;
+    uint32 fraction = 0;
+    uint32 fraction_digits = 0;
+    uint8 digit_seen = 0;
+    int32 sign = 1;
+
+    while((' ' == text[index]) || ('\t' == text[index]))
+    {
+        index ++;
+    }
+
+    if(('-' == text[index]) || ('+' == text[index]))
+    {
+        if('-' == text[index])
+        {
+            sign = -1;
+        }
+        index ++;
+    }
+
+    while((text[index] >= '0') && (text[index] <= '9'))
+    {
+        digit_seen = 1;
+        whole = whole * 10U + (uint32)(text[index] - '0');
+        if(whole > 100U)
+        {
+            return 0;
+        }
+        index ++;
+    }
+
+    if('.' == text[index])
+    {
+        index ++;
+        while((text[index] >= '0') && (text[index] <= '9'))
+        {
+            digit_seen = 1;
+            if(fraction_digits >= 2U)
+            {
+                return 0;
+            }
+            fraction = fraction * 10U + (uint32)(text[index] - '0');
+            fraction_digits ++;
+            index ++;
+        }
+    }
+
+    while((' ' == text[index]) || ('\t' == text[index]))
+    {
+        index ++;
+    }
+
+    if((!digit_seen) || ('\0' != text[index]))
+    {
+        return 0;
+    }
+
+    if(1U == fraction_digits)
+    {
+        fraction *= 10U;
+    }
+    *target_x100 = sign * (int32)(whole * 100U + fraction);
+    return 1;
+}
+
+static void wireless_print_status (void)
+{
+    int32 error_x100;
+    uint32 relative_abs;
+    uint32 target_abs;
+    uint32 error_abs;
+    uint32 frequency_abs;
+    char relative_sign;
+    char target_sign;
+    char error_sign;
+    char frequency_sign;
+
+    if(!s_encoder_feedback_valid)
+    {
+        wireless_debug_printf("waiting for MS42CG PWM on B10...\r\n");
+        return;
+    }
+
+    error_x100 = s_stepper_target_x100 - s_encoder_total_x100;
+    relative_abs = int32_abs_to_uint32(s_encoder_total_x100);
+    target_abs = int32_abs_to_uint32(s_stepper_target_x100);
+    error_abs = int32_abs_to_uint32(error_x100);
+    frequency_abs = int32_abs_to_uint32(s_stepper_frequency_pps);
+    relative_sign = (s_encoder_total_x100 < 0) ? '-' : '+';
+    target_sign = (s_stepper_target_x100 < 0) ? '-' : '+';
+    error_sign = (error_x100 < 0) ? '-' : '+';
+    frequency_sign = (s_stepper_frequency_pps < 0) ? '-' : '+';
+
+    wireless_debug_printf(
+        "abs=%3u.%02u, rel=%c%u.%02u, target=%c%u.%02u, err=%c%u.%02u, step=%c%upps, en=%u, high=%u, period=%u\r\n",
+        s_encoder_single_x100 / 100U, s_encoder_single_x100 % 100U,
+        relative_sign, relative_abs / 100U, relative_abs % 100U,
+        target_sign, target_abs / 100U, target_abs % 100U,
+        error_sign, error_abs / 100U, error_abs % 100U,
+        frequency_sign, frequency_abs, s_stepper_enabled,
+        s_encoder_high_ticks, s_encoder_period_ticks);
+}
+
+static void camera_print_status (void)
+{
+    uint32 position_abs;
+    uint32 velocity_abs;
+    char position_sign;
+    char velocity_sign;
+
+    if(s_camera_link_age > CAMERA_LINK_TIMEOUT_LOOPS)
+    {
+        wireless_debug_printf(
+            "cam=LINK_LOST, frames=%u, bad=%u, drop=%u, ovf=%u\r\n",
+            s_camera_valid_frame_count, s_camera_bad_frame_count,
+            s_camera_dropped_frame_count, s_camera_rx_overflow_count);
+        return;
+    }
+
+    if(!s_camera_measurement_valid)
+    {
+        wireless_debug_printf(
+            "cam=BALL_LOST, seq=%u, age=%ums, frames=%u, bad=%u, drop=%u, ovf=%u\r\n",
+            s_camera_sequence, s_camera_link_age,
+            s_camera_valid_frame_count, s_camera_bad_frame_count,
+            s_camera_dropped_frame_count, s_camera_rx_overflow_count);
+        return;
+    }
+
+    position_abs = int32_abs_to_uint32(s_camera_position_x100);
+    velocity_abs = int32_abs_to_uint32(s_camera_velocity_x100);
+    position_sign = (s_camera_position_x100 < 0) ? '-' : '+';
+    velocity_sign = (s_camera_velocity_x100 < 0) ? '-' : '+';
+    wireless_debug_printf(
+        "cam=VALID, seq=%u, pos=%c%u.%02ucm, vel=%c%u.%02ucm/s, age=%ums, t=%u, frames=%u, bad=%u, drop=%u, ovf=%u\r\n",
+        s_camera_sequence,
+        position_sign, position_abs / 100U, position_abs % 100U,
+        velocity_sign, velocity_abs / 100U, velocity_abs % 100U,
+        s_camera_link_age, s_camera_capture_ms_low16,
+        s_camera_valid_frame_count, s_camera_bad_frame_count,
+        s_camera_dropped_frame_count, s_camera_rx_overflow_count);
+}
+
+static void outer_pd_dry_print_status (void)
+{
+    uint32 error_abs;
+    uint32 p_abs;
+    uint32 d_abs;
+    uint32 command_abs;
+    char error_sign;
+    char p_sign;
+    char d_sign;
+    char command_sign;
+
+    if(!s_outer_dry_valid)
+    {
+        wireless_debug_printf(
+            "outer=DRY_SAFE, cmd=+0.00deg, applied=0, reason=%s\r\n",
+            (s_camera_link_age > CAMERA_LINK_TIMEOUT_LOOPS) ?
+                "LINK_LOST" : "BALL_LOST");
+        return;
+    }
+
+    error_abs = int32_abs_to_uint32(s_outer_dry_error_x100);
+    p_abs = int32_abs_to_uint32(s_outer_dry_p_term_x100);
+    d_abs = int32_abs_to_uint32(s_outer_dry_d_term_x100);
+    command_abs = int32_abs_to_uint32(s_outer_dry_command_x100);
+    error_sign = (s_outer_dry_error_x100 < 0) ? '-' : '+';
+    p_sign = (s_outer_dry_p_term_x100 < 0) ? '-' : '+';
+    d_sign = (s_outer_dry_d_term_x100 < 0) ? '-' : '+';
+    command_sign = (s_outer_dry_command_x100 < 0) ? '-' : '+';
+
+    wireless_debug_printf(
+        "outer=DRY, ball_err=%c%u.%02ucm, P=%c%u.%02udeg, D=%c%u.%02udeg, cmd=%c%u.%02udeg, sat=%u, applied=0\r\n",
+        error_sign, error_abs / 100U, error_abs % 100U,
+        p_sign, p_abs / 100U, p_abs % 100U,
+        d_sign, d_abs / 100U, d_abs % 100U,
+        command_sign, command_abs / 100U, command_abs % 100U,
+        s_outer_dry_saturated);
+}
+
+static void vision_control_print_status (void)
+{
+    uint32 position_abs;
+    uint32 velocity_abs;
+    uint32 command_abs;
+    uint32 relative_abs;
+    uint32 target_abs;
+    uint32 frequency_abs;
+    char position_sign;
+    char velocity_sign;
+    char command_sign;
+    char relative_sign;
+    char target_sign;
+    char frequency_sign;
+    const char *state;
+
+    position_abs = int32_abs_to_uint32(s_camera_position_x100);
+    velocity_abs = int32_abs_to_uint32(s_camera_velocity_x100);
+    command_abs = int32_abs_to_uint32(s_outer_dry_command_x100);
+    relative_abs = int32_abs_to_uint32(s_encoder_total_x100);
+    target_abs = int32_abs_to_uint32(s_stepper_target_x100);
+    frequency_abs = int32_abs_to_uint32(s_stepper_frequency_pps);
+    position_sign = (s_camera_position_x100 < 0) ? '-' : '+';
+    velocity_sign = (s_camera_velocity_x100 < 0) ? '-' : '+';
+    command_sign = (s_outer_dry_command_x100 < 0) ? '-' : '+';
+    relative_sign = (s_encoder_total_x100 < 0) ? '-' : '+';
+    target_sign = (s_stepper_target_x100 < 0) ? '-' : '+';
+    frequency_sign = (s_stepper_frequency_pps < 0) ? '-' : '+';
+    state = s_vision_ball_lost ? "REACQ" : "ACTIVE";
+
+    wireless_debug_printf(
+        "ctrl=%s, x=%c%u.%02u, v=%c%u.%02u, cmd=%c%u.%02u, rel=%c%u.%02u, tgt=%c%u.%02u, step=%c%u, age=%u, sat=%u\r\n",
+        state,
+        position_sign, position_abs / 100U, position_abs % 100U,
+        velocity_sign, velocity_abs / 100U, velocity_abs % 100U,
+        command_sign, command_abs / 100U, command_abs % 100U,
+        relative_sign, relative_abs / 100U, relative_abs % 100U,
+        target_sign, target_abs / 100U, target_abs % 100U,
+        frequency_sign, frequency_abs, s_camera_link_age,
+        s_outer_dry_saturated);
+}
+
+static void wireless_print_help (void)
+{
+    wireless_debug_printf("Commands: Z=zero(level), E=enable, V=vision ON, M=manual/level\r\n");
+    wireless_debug_printf("          S=stop/disable, I=invert DIR, T+10/T-10/T0=manual target\r\n");
+}
+
+static void wireless_execute_command (const char *command)
+{
+    int32 requested_target;
+    uint32 current_abs;
+    char current_sign;
+
+    switch(command[0])
+    {
+        case 'z':
+        case 'Z':
+        {
+            if(s_stepper_enabled)
+            {
+                wireless_debug_printf("Z rejected: send S before resetting zero\r\n");
+            }
+            else if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok))
+            {
+                wireless_debug_printf("Z rejected: encoder PWM is not valid\r\n");
+            }
+            else if((s_encoder_single_x100 <= STEPPER_ABSOLUTE_MIN_X100) ||
+                    (s_encoder_single_x100 >= STEPPER_ABSOLUTE_MAX_X100))
+            {
+                wireless_debug_printf("Z rejected: absolute angle outside soft limits\r\n");
+            }
+            else
+            {
+                s_encoder_total_x100 = 0;
+                s_encoder_wrap_count = 0;
+                s_encoder_last_x100 = s_encoder_single_x100;
+                s_encoder_multiturn_initialized = 1;
+                s_stepper_target_x100 = 0;
+                s_vision_control_active = 0U;
+                s_vision_ball_lost = 1U;
+                s_stepper_zero_set = 1;
+                s_stepper_fault = STEPPER_FAULT_NONE;
+                s_direction_check_active = 0;
+                wireless_debug_printf("ZERO SET: abs=%u.%02u deg, rel=+0.00 deg\r\n",
+                    s_encoder_single_x100 / 100U,
+                    s_encoder_single_x100 % 100U);
+            }
+        }break;
+
+        case 'e':
+        case 'E':
+        {
+            if(s_stepper_enabled)
+            {
+                wireless_debug_printf("Motor already enabled\r\n");
+            }
+            else if(!s_stepper_zero_set)
+            {
+                wireless_debug_printf("E rejected: put mechanism level and send Z first\r\n");
+            }
+            else if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok) ||
+                    (s_encoder_feedback_age > STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+            {
+                wireless_debug_printf("E rejected: encoder PWM is not valid\r\n");
+            }
+            else if((s_encoder_single_x100 <= STEPPER_ABSOLUTE_MIN_X100) ||
+                    (s_encoder_single_x100 >= STEPPER_ABSOLUTE_MAX_X100) ||
+                    (int32_abs_to_uint32(s_encoder_total_x100) >
+                        STEPPER_TEST_TRIP_LIMIT_X100))
+            {
+                wireless_debug_printf("E rejected: current angle outside test range\r\n");
+            }
+            else
+            {
+                stepper_stop_pulses();
+                s_stepper_fault = STEPPER_FAULT_NONE;
+                gpio_high(STEPPER_EN_PIN);
+                s_stepper_enabled = 1;
+                stepper_start_direction_check();
+                wireless_debug_printf("MOTOR ENABLED: target retained, keep hands clear\r\n");
+            }
+        }break;
+
+        case 's':
+        case 'S':
+        {
+            s_vision_control_active = 0U;
+            s_vision_ball_lost = 1U;
+            stepper_disable_output();
+            if(s_encoder_feedback_valid && s_stepper_zero_set)
+            {
+                s_stepper_target_x100 = s_encoder_total_x100;
+            }
+            s_stepper_fault = STEPPER_FAULT_NONE;
+            wireless_debug_printf("MOTOR STOPPED / DISABLED\r\n");
+        }break;
+
+        case 'i':
+        case 'I':
+        {
+            if(s_stepper_enabled)
+            {
+                wireless_debug_printf("I rejected: send S before changing DIR polarity\r\n");
+            }
+            else
+            {
+                s_stepper_direction_inverted = !s_stepper_direction_inverted;
+                if(s_encoder_feedback_valid && s_stepper_zero_set)
+                {
+                    s_stepper_target_x100 = s_encoder_total_x100;
+                }
+                wireless_debug_printf("DIR polarity inverted=%u\r\n",
+                    s_stepper_direction_inverted);
+            }
+        }break;
+
+        case 't':
+        case 'T':
+        {
+            if(!s_stepper_zero_set)
+            {
+                wireless_debug_printf("T rejected: send Z at level position first\r\n");
+            }
+            else if(s_vision_control_active)
+            {
+                wireless_debug_printf("T rejected: send M to leave vision control first\r\n");
+            }
+            else if(!parse_target_angle_x100(&command[1], &requested_target))
+            {
+                wireless_debug_printf("T format error; examples: T+1, T-1, T0\r\n");
+            }
+            else if(int32_abs_to_uint32(requested_target) >
+                    STEPPER_TARGET_LIMIT_X100)
+            {
+                wireless_debug_printf("T rejected: safe range is +/-20.00 deg\r\n");
+            }
+            else
+            {
+                s_stepper_target_x100 = requested_target;
+                stepper_start_direction_check();
+                current_abs = int32_abs_to_uint32(requested_target);
+                current_sign = (requested_target < 0) ? '-' : '+';
+                wireless_debug_printf("TARGET SET: %c%u.%02u deg%s\r\n",
+                    current_sign, current_abs / 100U, current_abs % 100U,
+                    s_stepper_enabled ? "" : " (motor disabled)");
+            }
+        }break;
+
+        case 'v':
+        case 'V':
+        {
+            if(s_vision_control_active)
+            {
+                wireless_debug_printf("VISION CONTROL already active\r\n");
+            }
+            else if(!s_stepper_enabled)
+            {
+                wireless_debug_printf("V rejected: send E first\r\n");
+            }
+            else if((!s_stepper_zero_set) || (!s_encoder_feedback_valid) ||
+                    (!g_ms42_pwm_signal_ok))
+            {
+                wireless_debug_printf("V rejected: zero/encoder is not valid\r\n");
+            }
+            else if(int32_abs_to_uint32(s_encoder_total_x100) >
+                    VISION_START_ANGLE_LIMIT_X100)
+            {
+                wireless_debug_printf("V rejected: return mechanism within +/-3.00deg first\r\n");
+            }
+            else if((s_camera_link_age > VISION_LINK_TIMEOUT_LOOPS) ||
+                    (!s_camera_measurement_valid))
+            {
+                wireless_debug_printf("V rejected: camera link/ball is not valid\r\n");
+            }
+            else if(int32_abs_to_uint32(s_camera_position_x100) >
+                    VISION_START_POSITION_LIMIT_X100)
+            {
+                wireless_debug_printf("V rejected: put ball within +/-10.00cm first\r\n");
+            }
+            else
+            {
+                vision_command_level(0U);
+                s_vision_control_active = 1U;
+                s_vision_ball_lost = 1U;
+                s_vision_sequence_seen = 1U;
+                s_vision_last_sequence = s_camera_sequence;
+                s_vision_lost_frame_count = 0U;
+                s_vision_reacquire_count = 0U;
+                s_direction_check_active = 0U;
+                wireless_debug_printf(
+                    "VISION CONTROL ARMED: low gain, +/-10deg, S=stop, M=level\r\n");
+            }
+        }break;
+
+        case 'm':
+        case 'M':
+        {
+            s_vision_control_active = 0U;
+            s_vision_ball_lost = 1U;
+            s_vision_sequence_seen = 0U;
+            s_vision_lost_frame_count = 0U;
+            s_vision_reacquire_count = 0U;
+            vision_command_level(1U);
+            wireless_debug_printf("MANUAL/LEVEL MODE: target=+0.00deg, motor en=%u\r\n",
+                s_stepper_enabled);
+        }break;
+
+        case 'h':
+        case 'H':
+        {
+            wireless_print_help();
+        }break;
+
+        default:
+        {
+            wireless_debug_printf("Unknown command: %s\r\n", command);
+        }break;
+    }
+}
+
+static void wireless_finish_buffered_command (void)
+{
+    if(0U == s_wireless_command_length)
+    {
+        return;
+    }
+
+    s_wireless_command_buffer[s_wireless_command_length] = '\0';
+    wireless_execute_command(s_wireless_command_buffer);
+    s_wireless_command_length = 0;
+    s_wireless_command_idle = 0;
+}
+
+static void wireless_accept_character (uint8 character)
+{
+    char immediate_command[2];
+
+    if(0x00U == character)
+    {
+        return;
+    }
+
+    if(('\r' == character) || ('\n' == character))
+    {
+        wireless_finish_buffered_command();
+        return;
+    }
+
+    // 单字符安全命令立即执行，即使串口助手没有附加回车换行。
+    if((0U == s_wireless_command_length) &&
+       (('Z' == character) || ('z' == character) ||
+        ('E' == character) || ('e' == character) ||
+         ('S' == character) || ('s' == character) ||
+         ('I' == character) || ('i' == character) ||
+         ('V' == character) || ('v' == character) ||
+         ('M' == character) || ('m' == character) ||
+         ('H' == character) || ('h' == character)))
+    {
+        immediate_command[0] = (char)character;
+        immediate_command[1] = '\0';
+        wireless_execute_command(immediate_command);
+        return;
+    }
+
+    if((character >= 0x20U) && (character <= 0x7EU))
+    {
+        if(s_wireless_command_length < (WIRELESS_COMMAND_BUFFER_SIZE - 1U))
+        {
+            s_wireless_command_buffer[s_wireless_command_length] = (char)character;
+            s_wireless_command_length ++;
+            s_wireless_command_idle = 0;
+        }
+        else
+        {
+            s_wireless_command_length = 0;
+            s_wireless_command_idle = 0;
+            wireless_debug_printf("Command too long\r\n");
+        }
+    }
+}
+
+int main (void)
+{
+    uint32 high_ticks;
+    uint32 period_ticks;
+    uint32 primask;
+    uint8 wireless_rx_buffer[WIRELESS_UART_BUFFER_SIZE];
+    uint32 wireless_rx_length;
+    uint32 wireless_rx_index;
+    uint32 status_counter = 0;
+    uint8 valid_sample_this_loop;
+
+    clock_init(SYSTEM_CLOCK_80M);   // 时钟配置及系统初始化<务必保留>
+
+    // 上电安全状态：先拉低 DIR/EN，再初始化 STEP 硬件 PWM 且强制输出低电平。
+    gpio_init(STEPPER_DIR_PIN,  GPO, GPIO_LOW, GPO_PUSH_PULL);
+    gpio_init(STEPPER_EN_PIN,   GPO, GPIO_LOW, GPO_PUSH_PULL);
+    stepper_pwm_init();
+
+    if(wireless_uart_init())
+    {
+        // 自动波特率关闭时一般不会进入这里；初始化失败则保持电机失能。
+        while(true)
+        {
+            system_delay_ms(100);
+        }
+    }
+
+    camera_uart_init();
+    ms42_pwm_capture_init();
+    interrupt_global_enable(0);
+
+    wireless_debug_printf("\r\nMS42CG encoder + D36A angle-loop test\r\n");
+    wireless_debug_printf("Wireless UART: 115200, B6=TX, B7=RX, B2=RTS\r\n");
+    wireless_debug_printf("Encoder PWM=B10, STEP=B12, DIR=B13, EN=B8(high=enable)\r\n");
+    wireless_debug_printf("Vision UART2: B15=TX, B16=RX, 115200\r\n");
+    wireless_debug_printf("Outer PD: Kp=1.00, Kd=0.22, limit=+/-10deg, slew=0.40deg/frame\r\n");
+    wireless_debug_printf("Boot: motor/vision OFF. Level -> Z -> E; send V only when ready.\r\n");
+    wireless_debug_printf("Limits: target +/-20deg, test trip +/-25deg, absolute 121~208deg\r\n");
+    wireless_print_help();
+
+    while(true)
+    {
+        valid_sample_this_loop = 0;
+
+        if(g_ms42_pwm_sample_ready)
+        {
+            // 复制一组彼此对应的中断数据，避免复制过程中恰好被下一帧更新。
+            primask = interrupt_global_disable();
+            high_ticks = g_ms42_pwm_high_ticks;
+            period_ticks = g_ms42_pwm_period_ticks;
+            g_ms42_pwm_sample_ready = 0;
+            interrupt_global_enable(primask);
+
+            if(ms42_process_sample(high_ticks, period_ticks))
+            {
+                valid_sample_this_loop = 1;
+            }
+        }
+
+        if((!valid_sample_this_loop) &&
+           (s_encoder_feedback_age <= STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+        {
+            s_encoder_feedback_age ++;
+        }
+
+        wireless_rx_length = wireless_uart_read_buffer(
+            wireless_rx_buffer, WIRELESS_UART_BUFFER_SIZE);
+        for(wireless_rx_index = 0;
+            wireless_rx_index < wireless_rx_length;
+            wireless_rx_index ++)
+        {
+            wireless_accept_character(wireless_rx_buffer[wireless_rx_index]);
+        }
+
+        if((0U == wireless_rx_length) && (s_wireless_command_length > 0U))
+        {
+            s_wireless_command_idle ++;
+            if(s_wireless_command_idle >= WIRELESS_COMMAND_IDLE_LOOPS)
+            {
+                wireless_finish_buffered_command();
+            }
+        }
+
+        camera_uart_process_received_data();
+        if(s_camera_link_age <= CAMERA_LINK_TIMEOUT_LOOPS)
+        {
+            s_camera_link_age ++;
+        }
+        outer_pd_dry_run_update();
+        vision_control_update();
+
+        stepper_control_update();
+
+        status_counter ++;
+        if(s_vision_control_active)
+        {
+            if(status_counter >= WIRELESS_ACTIVE_STATUS_PERIOD_LOOPS)
+            {
+                status_counter = 0;
+                vision_control_print_status();
+            }
+        }
+        else if(status_counter >= WIRELESS_STATUS_PERIOD_LOOPS)
+        {
+            status_counter = 0;
+            wireless_print_status();
+            camera_print_status();
+            outer_pd_dry_print_status();
+        }
+
+        system_delay_ms(1);
+    }
+}
