@@ -54,14 +54,15 @@
 #define STEPPER_TARGET_LIMIT_X100            (2000)
 #define STEPPER_TEST_TRIP_LIMIT_X100         (2500)
 #define STEPPER_POSITION_DEADBAND_X100       (15)
-#define STEPPER_KP_PPS_PER_DEG               (250U)
+#define STEPPER_KP_PPS_PER_DEG               (400U)
 #define STEPPER_MIN_FREQUENCY_PPS            (100U)
-#define STEPPER_MAX_FREQUENCY_PPS            (1000U)
-#define STEPPER_SLEW_PPS_PER_MS              (20)
+#define STEPPER_MAX_FREQUENCY_PPS            (1600U)
+#define STEPPER_SLEW_PPS_PER_MS              (50)
 
 // 电机重新安装后实测机械极限约为 115.22~213.66 度；保留至少 5 度余量。
 #define STEPPER_ABSOLUTE_MIN_X100            (12100U)
 #define STEPPER_ABSOLUTE_MAX_X100            (20800U)
+#define STEPPER_ABSOLUTE_LIMIT_CONFIRM_SAMPLES (5U)  // require 5 consecutive valid samples outside soft range
 #define STEPPER_FEEDBACK_TIMEOUT_LOOPS       (50U)
 
 // 每 50ms 检查一次误差是否反而增大，自动拦截 DIR 极性接反造成的失控。
@@ -77,6 +78,11 @@
 #define MS42_PWM_HEADER_HIGH_CLOCKS          (16U)
 #define MS42_PWM_ANGLE_COUNTS                (4096U)
 #define MS42_PWM_EDGE_TOLERANCE_CLOCKS       (2U)
+#define MS42_PWM_FAST_PERIOD_MIN_TICKS       (16000U) // 971Hz mode, nominal period about 20590 ticks
+#define MS42_PWM_FAST_PERIOD_MAX_TICKS       (25000U)
+#define MS42_PWM_SLOW_PERIOD_MIN_TICKS       (33000U) // 486Hz mode, nominal period about 41180 ticks
+#define MS42_PWM_SLOW_PERIOD_MAX_TICKS       (50000U)
+#define MS42_MAX_SAMPLE_DELTA_X100           (300)   // reject impossible >3.00deg change in one PWM frame
 
 #define WIRELESS_DEBUG_BUFFER_SIZE           (192U)
 #define WIRELESS_COMMAND_BUFFER_SIZE         (24U)
@@ -107,7 +113,7 @@
 #define POSITION_PID_KD_X100                 (100)   // 1.00 (cm/s)/(cm/s), early braking
 #define POSITION_PID_I_LIMIT_X100            (200)   // 目标速度积分项 +/-2.00cm/s
 #define POSITION_PID_SPEED_LIMIT_X100        (2000)  // 最大目标球速 +/-20.00cm/s
-#define POSITION_SPEED_ACCEL_X100_PER_S      (6000)  // 目标球速加速斜率 60.00cm/s^2
+#define POSITION_SPEED_ACCEL_X100_PER_S      (20000) // 目标球速加速斜率 200.00cm/s^2
 #define POSITION_BRAKE_ACCEL_X100            (1500)  // 保守按 15.00cm/s^2 规划刹车
 #define POSITION_SETTLE_BAND_X100            (8)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
@@ -117,7 +123,8 @@
 #define SPEED_PID_KD_X100                    (3)     // 0.03 deg/(cm/s^2)
 #define SPEED_PID_I_LIMIT_X100               (250)   // 速度环积分项 +/-2.50deg
 #define SPEED_PID_ACCEL_LIMIT_X100           (5000)  // D项加速度输入限制 +/-50.00cm/s^2
-#define SPEED_PID_ANGLE_LIMIT_X100           (800)   // 速度环摆角限制 +/-8.00deg
+#define SPEED_PID_POSITIVE_ANGLE_LIMIT_X100  (800)   // 小球向X负方向时横梁最高 +8.00deg
+#define SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100  (800)   // 小球向X正方向时横梁最低 -8.00deg
 #define SPEED_SETTLE_BAND_X100               (15)    // 速度稳定带 +/-0.15cm/s
 
 #define PID_INTEGRAL_SCALE                   (100000)
@@ -125,15 +132,15 @@
 #define SPEED_PID_I_ACCUM_LIMIT              (SPEED_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE)
 
 // 加速时平缓改变摆角；需要制动时允许更快地反向倾斜。
-#define VISION_ACCEL_ANGLE_SLEW_X100         (40)    // 0.40deg per camera frame
-#define VISION_BRAKE_ANGLE_SLEW_X100         (100)   // 1.00deg per camera frame
+#define VISION_ACCEL_ANGLE_SLEW_X100         (120)   // 1.20deg per camera frame
+#define VISION_BRAKE_ANGLE_SLEW_X100         (200)   // 2.00deg per camera frame
 #define VISION_POSITION_LIMIT_X100           (1200)  // calibrated useful range +/-12.00cm
 #define VISION_VELOCITY_LIMIT_X100           (5000)  // reject implausible values above 50.00cm/s
 #define VISION_TARGET_POSITION_LIMIT_X100    (1000)  // target range +/-10.00cm
 #define VISION_START_ERROR_LIMIT_X100        (2000)  // allow full -10cm -> +10cm travel
 #define VISION_START_ANGLE_LIMIT_X100        (300)   // V accepted only near level (+/-3.00deg)
-#define VISION_BALL_LOST_FRAME_LIMIT         (3U)    // about 60ms at 50Hz UART packets
-#define VISION_REACQUIRE_VALID_FRAMES        (5U)    // about 100ms stable reacquisition
+#define VISION_BALL_LOST_FRAME_LIMIT         (3U)    // about 60ms on the 50Hz vision stream
+#define VISION_REACQUIRE_VALID_FRAMES        (2U)    // about 40ms stable reacquisition
 #define VISION_LINK_TIMEOUT_LOOPS            (120U)  // dedicated-link loss: return level in about 120ms
 
 // Manual breakaway-pulse calibration. These commands are available only in
@@ -151,6 +158,23 @@
 #define MANUAL_PULSE_START_SPEED_X100        (30)    // require |velocity| <= 0.30cm/s
 #define MANUAL_PULSE_STOP_DISTANCE_X100      (15)    // stop after 0.15cm detected motion
 #define MANUAL_PULSE_STOP_SPEED_X100         (50)    // or |velocity| >= 0.50cm/s
+
+// Automatic static-friction compensation for the vision speed loop.  The
+// launch angles include 0.20deg margin for the angle execution deadband.
+// Compensation is removed as soon as directional displacement or velocity is
+// detected, so normal PID braking remains in control near the target.
+#define SPEED_STICTION_POSITION_ERROR_X100   (60)    // correct only while error is above 0.60cm
+#define SPEED_STICTION_VELOCITY_X100         (30)    // detect a stuck ball below 0.30cm/s
+#define SPEED_STICTION_TARGET_SPEED_X100     (50)    // ignore tiny velocity requests below 0.50cm/s
+#define SPEED_STICTION_RELEASE_SPEED_X100    (30)    // release after 0.30cm/s directional motion
+#define SPEED_STICTION_RELEASE_DISTANCE_X100 (5)     // or after 0.05cm directional displacement
+#define SPEED_STICTION_DETECT_FRAMES         (3U)    // about 60ms on the 50Hz vision stream
+#define SPEED_STICTION_MAX_ACTIVE_FRAMES     (12U)   // limit one launch attempt to about 240ms
+#define SPEED_STICTION_LEFT_BASE_X100        (480)   // first launch target for ball motion left
+#define SPEED_STICTION_RIGHT_BASE_X100       (-460)  // first launch target for ball motion right
+#define SPEED_STICTION_ANGLE_STEP_X100       (25)    // add 0.25deg after a no-motion timeout
+#define SPEED_STICTION_LEFT_MAX_X100         (650)   // adaptive launch ceiling +6.50deg
+#define SPEED_STICTION_RIGHT_MAX_X100        (-650)  // adaptive launch floor -6.50deg
 
 typedef enum
 {
@@ -188,6 +212,8 @@ static int32  s_encoder_wrap_count = 0;
 static uint32 s_encoder_feedback_age = STEPPER_FEEDBACK_TIMEOUT_LOOPS + 1U;
 static uint8  s_encoder_multiturn_initialized = 0;
 static uint8  s_encoder_feedback_valid = 0;
+static uint8  s_encoder_absolute_violation_count = 0;
+static uint32 s_encoder_rejected_sample_count = 0;
 
 static int32  s_stepper_target_x100 = 0;
 static int32  s_stepper_frequency_pps = 0;
@@ -252,6 +278,17 @@ static int32  s_vision_angle_command_x100 = 0;
 static uint16 s_cascade_last_capture_ms = 0;
 static uint8  s_cascade_time_seen = 0;
 static uint8  s_speed_output_saturated = 0;
+static uint8  s_speed_stiction_detect_count = 0;
+static uint8  s_speed_stiction_active = 0;
+static uint8  s_speed_stiction_active_frames = 0;
+static int8   s_speed_stiction_direction = 0;
+static int32  s_speed_stiction_start_position_x100 = 0;
+static int32  s_speed_stiction_launch_angle_x100 = 0;
+static int32  s_speed_stiction_last_launch_angle_x100 = 0;
+static uint8  s_speed_stiction_retry_level = 0;
+static uint8  s_speed_stiction_blocked = 0;
+static int8   s_speed_stiction_last_direction = 0;
+static uint32 s_speed_stiction_event_count = 0;
 static uint8  s_manual_pulse_active = 0;
 static uint32 s_manual_pulse_counter = 0;
 static int8   s_manual_pulse_direction = 0;
@@ -509,6 +546,168 @@ static void cascade_pid_reset (void)
     s_cascade_last_capture_ms = 0U;
     s_cascade_time_seen = 0U;
     s_speed_output_saturated = 0U;
+    s_speed_stiction_detect_count = 0U;
+    s_speed_stiction_active = 0U;
+    s_speed_stiction_active_frames = 0U;
+    s_speed_stiction_direction = 0;
+    s_speed_stiction_start_position_x100 = 0;
+    s_speed_stiction_launch_angle_x100 = 0;
+    s_speed_stiction_last_launch_angle_x100 = 0;
+    s_speed_stiction_retry_level = 0U;
+    s_speed_stiction_blocked = 0U;
+    s_speed_stiction_last_direction = 0;
+    s_speed_stiction_event_count = 0U;
+}
+
+static int32 speed_stiction_launch_angle (int8 direction)
+{
+    int32 launch_angle_x100;
+    int32 retry_extra_x100 =
+        (int32)s_speed_stiction_retry_level * SPEED_STICTION_ANGLE_STEP_X100;
+
+    if(direction > 0)
+    {
+        launch_angle_x100 = SPEED_STICTION_RIGHT_BASE_X100 -
+            retry_extra_x100;
+        if(launch_angle_x100 < SPEED_STICTION_RIGHT_MAX_X100)
+        {
+            launch_angle_x100 = SPEED_STICTION_RIGHT_MAX_X100;
+        }
+    }
+    else
+    {
+        launch_angle_x100 = SPEED_STICTION_LEFT_BASE_X100 +
+            retry_extra_x100;
+        if(launch_angle_x100 > SPEED_STICTION_LEFT_MAX_X100)
+        {
+            launch_angle_x100 = SPEED_STICTION_LEFT_MAX_X100;
+        }
+    }
+    return launch_angle_x100;
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// Function brief      Detect a stationary ball that needs a measured breakaway angle
+// Remarks             Directional velocity releases the boost immediately; every attempt also has a hard frame limit
+//-------------------------------------------------------------------------------------------------------------------
+static void speed_stiction_update (uint32 error_abs, uint32 velocity_abs)
+{
+    int32 directional_displacement_x100;
+    int8 active_direction;
+    int8 requested_direction = 0;
+    uint8 directional_motion = 0U;
+    uint8 launch_request_valid = 0U;
+
+    if((s_position_error_x100 > 0) && (s_ball_target_velocity_x100 > 0))
+    {
+        requested_direction = 1;
+    }
+    else if((s_position_error_x100 < 0) &&
+            (s_ball_target_velocity_x100 < 0))
+    {
+        requested_direction = -1;
+    }
+
+    launch_request_valid =
+        (!s_position_target_crossed) &&
+        (error_abs > SPEED_STICTION_POSITION_ERROR_X100) &&
+        (int32_abs_to_uint32(s_ball_target_velocity_x100) >=
+            SPEED_STICTION_TARGET_SPEED_X100) &&
+        (0 != requested_direction);
+
+    if((error_abs <= SPEED_STICTION_POSITION_ERROR_X100) ||
+       ((0 != requested_direction) &&
+        (0 != s_speed_stiction_last_direction) &&
+        (requested_direction != s_speed_stiction_last_direction)))
+    {
+        s_speed_stiction_retry_level = 0U;
+        s_speed_stiction_blocked = 0U;
+    }
+
+    if(s_speed_stiction_active)
+    {
+        s_speed_stiction_active_frames ++;
+        directional_displacement_x100 = s_camera_position_x100 -
+            s_speed_stiction_start_position_x100;
+        directional_motion =
+            (((s_speed_stiction_direction > 0) &&
+                ((s_camera_velocity_x100 >= SPEED_STICTION_RELEASE_SPEED_X100) ||
+                 (directional_displacement_x100 >=
+                    SPEED_STICTION_RELEASE_DISTANCE_X100))) ||
+             ((s_speed_stiction_direction < 0) &&
+                ((s_camera_velocity_x100 <= -SPEED_STICTION_RELEASE_SPEED_X100) ||
+                 (directional_displacement_x100 <=
+                    -SPEED_STICTION_RELEASE_DISTANCE_X100)))) ?
+                1U : 0U;
+
+        if((!launch_request_valid) || directional_motion ||
+           (requested_direction != s_speed_stiction_direction) ||
+           (s_speed_stiction_active_frames >=
+                SPEED_STICTION_MAX_ACTIVE_FRAMES))
+        {
+            active_direction = s_speed_stiction_direction;
+            if((!directional_motion) && launch_request_valid &&
+               (requested_direction == active_direction) &&
+               (s_speed_stiction_active_frames >=
+                    SPEED_STICTION_MAX_ACTIVE_FRAMES))
+            {
+                if(((active_direction > 0) &&
+                    (s_speed_stiction_launch_angle_x100 <=
+                        SPEED_STICTION_RIGHT_MAX_X100)) ||
+                   ((active_direction < 0) &&
+                    (s_speed_stiction_launch_angle_x100 >=
+                        SPEED_STICTION_LEFT_MAX_X100)))
+                {
+                    // The maximum adaptive angle still produced no motion.
+                    // Stop retrying until a new target/control reset.
+                    s_speed_stiction_blocked = 1U;
+                }
+                else if(s_speed_stiction_retry_level < 255U)
+                {
+                    s_speed_stiction_retry_level ++;
+                }
+            }
+            s_speed_stiction_active = 0U;
+            s_speed_stiction_active_frames = 0U;
+            s_speed_stiction_detect_count = 0U;
+            s_speed_stiction_direction = 0;
+            s_speed_stiction_start_position_x100 = 0;
+            s_speed_stiction_launch_angle_x100 = 0;
+        }
+        return;
+    }
+
+    if(launch_request_valid && (!s_speed_stiction_blocked) &&
+       (velocity_abs <= SPEED_STICTION_VELOCITY_X100))
+    {
+        if(s_speed_stiction_detect_count < SPEED_STICTION_DETECT_FRAMES)
+        {
+            s_speed_stiction_detect_count ++;
+        }
+        if(s_speed_stiction_detect_count >= SPEED_STICTION_DETECT_FRAMES)
+        {
+            s_speed_stiction_active = 1U;
+            s_speed_stiction_active_frames = 0U;
+            s_speed_stiction_detect_count = 0U;
+            s_speed_stiction_direction = requested_direction;
+            s_speed_stiction_start_position_x100 = s_camera_position_x100;
+            s_speed_stiction_launch_angle_x100 =
+                speed_stiction_launch_angle(requested_direction);
+            s_speed_stiction_last_launch_angle_x100 =
+                s_speed_stiction_launch_angle_x100;
+            s_speed_stiction_last_direction = requested_direction;
+            s_speed_stiction_event_count ++;
+
+            // The launch-angle floor replaces slow integral buildup.  Clearing
+            // the I term here lets braking take over cleanly after movement.
+            s_speed_i_accumulator = 0;
+            s_speed_i_term_x100 = 0;
+        }
+    }
+    else
+    {
+        s_speed_stiction_detect_count = 0U;
+    }
 }
 
 //-------------------------------------------------------------------------------------------------------------------
@@ -528,6 +727,7 @@ static void cascade_pid_update (void)
     int32 max_velocity_increase_x100;
     int32 raw_accel_x100;
     int32 speed_effort_x100;
+    int32 speed_integral_angle_limit_x100;
     int32 desired_angle_x100;
     int32 target_angle_delta_x100;
     int32 angle_slew_limit_x100;
@@ -682,6 +882,8 @@ static void cascade_pid_update (void)
         s_ball_target_velocity_x100 = desired_velocity_x100;
     }
 
+    speed_stiction_update(error_abs, velocity_abs);
+
     raw_accel_x100 = ((s_camera_velocity_x100 -
         s_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
     raw_accel_x100 = int32_clamp(raw_accel_x100,
@@ -699,9 +901,15 @@ static void cascade_pid_update (void)
 
     command_without_new_i = s_speed_p_term_x100 +
         s_speed_i_term_x100 + s_speed_d_term_x100;
+    // speed_effort and beam angle have opposite signs: negative effort
+    // produces the positive beam angle used for motion toward X-.
+    speed_integral_angle_limit_x100 = (command_without_new_i < 0) ?
+        SPEED_PID_POSITIVE_ANGLE_LIMIT_X100 :
+        SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100;
     speed_integral_allowed = (!settled) &&
+        (!s_speed_stiction_active) &&
         (int32_abs_to_uint32(command_without_new_i) <
-            SPEED_PID_ANGLE_LIMIT_X100);
+            (uint32)speed_integral_angle_limit_x100);
     if(speed_integral_allowed)
     {
         candidate_accumulator = s_speed_i_accumulator +
@@ -725,15 +933,28 @@ static void cascade_pid_update (void)
 
     // Positive beam angle accelerates the ball left, hence the minus sign.
     desired_angle_x100 = -speed_effort_x100;
-    s_speed_output_saturated = 0U;
-    if(desired_angle_x100 > SPEED_PID_ANGLE_LIMIT_X100)
+    if(s_speed_stiction_active)
     {
-        desired_angle_x100 = SPEED_PID_ANGLE_LIMIT_X100;
+        if((s_speed_stiction_direction > 0) &&
+           (desired_angle_x100 > s_speed_stiction_launch_angle_x100))
+        {
+            desired_angle_x100 = s_speed_stiction_launch_angle_x100;
+        }
+        else if((s_speed_stiction_direction < 0) &&
+                (desired_angle_x100 < s_speed_stiction_launch_angle_x100))
+        {
+            desired_angle_x100 = s_speed_stiction_launch_angle_x100;
+        }
+    }
+    s_speed_output_saturated = 0U;
+    if(desired_angle_x100 > SPEED_PID_POSITIVE_ANGLE_LIMIT_X100)
+    {
+        desired_angle_x100 = SPEED_PID_POSITIVE_ANGLE_LIMIT_X100;
         s_speed_output_saturated = 1U;
     }
-    else if(desired_angle_x100 < -SPEED_PID_ANGLE_LIMIT_X100)
+    else if(desired_angle_x100 < -SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100)
     {
-        desired_angle_x100 = -SPEED_PID_ANGLE_LIMIT_X100;
+        desired_angle_x100 = -SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100;
         s_speed_output_saturated = 1U;
     }
     s_vision_angle_command_x100 = desired_angle_x100;
@@ -1207,8 +1428,8 @@ static void stepper_control_update (void)
         return;
     }
 
-    if((s_encoder_single_x100 <= STEPPER_ABSOLUTE_MIN_X100) ||
-       (s_encoder_single_x100 >= STEPPER_ABSOLUTE_MAX_X100))
+    if(s_encoder_absolute_violation_count >=
+        STEPPER_ABSOLUTE_LIMIT_CONFIRM_SAMPLES)
     {
         stepper_trip(STEPPER_FAULT_ABSOLUTE_LIMIT, "absolute angle limit");
         return;
@@ -1401,7 +1622,11 @@ static uint8 ms42_pwm_get_angle_x100 (
     const uint32 maximum_high_clocks =
         MS42_PWM_HEADER_HIGH_CLOCKS + MS42_PWM_ANGLE_COUNTS - 1U;
 
-    if((0U == period_ticks) || (high_ticks >= period_ticks))
+    if((0U == period_ticks) || (high_ticks >= period_ticks) ||
+       (!(((period_ticks >= MS42_PWM_FAST_PERIOD_MIN_TICKS) &&
+             (period_ticks <= MS42_PWM_FAST_PERIOD_MAX_TICKS)) ||
+           ((period_ticks >= MS42_PWM_SLOW_PERIOD_MIN_TICKS) &&
+             (period_ticks <= MS42_PWM_SLOW_PERIOD_MAX_TICKS)))))
     {
         return 0;
     }
@@ -1440,12 +1665,9 @@ static uint8 ms42_process_sample (uint32 high_ticks, uint32 period_ticks)
 
     if(!ms42_pwm_get_angle_x100(high_ticks, period_ticks, &angle_x100))
     {
+        s_encoder_rejected_sample_count ++;
         return 0;
     }
-
-    s_encoder_high_ticks = high_ticks;
-    s_encoder_period_ticks = period_ticks;
-    s_encoder_single_x100 = angle_x100;
 
     if(!s_encoder_multiturn_initialized)
     {
@@ -1460,16 +1682,51 @@ static uint8 ms42_process_sample (uint32 high_ticks, uint32 period_ticks)
         if(raw_delta_x100 > 18000)
         {
             delta_x100 -= 36000;
-            s_encoder_wrap_count --;
         }
         else if(raw_delta_x100 < -18000)
         {
             delta_x100 += 36000;
+        }
+
+        if(int32_abs_to_uint32(delta_x100) >
+            MS42_MAX_SAMPLE_DELTA_X100)
+        {
+            // A real mechanism cannot rotate more than 3 degrees in one
+            // 1~2ms encoder frame.  Ignore the isolated capture glitch and
+            // keep the previous absolute/multiturn state.
+            s_encoder_rejected_sample_count ++;
+            return 0;
+        }
+
+        if(raw_delta_x100 > 18000)
+        {
+            s_encoder_wrap_count --;
+        }
+        else if(raw_delta_x100 < -18000)
+        {
             s_encoder_wrap_count ++;
         }
 
         s_encoder_total_x100 += delta_x100;
         s_encoder_last_x100 = angle_x100;
+    }
+
+    s_encoder_high_ticks = high_ticks;
+    s_encoder_period_ticks = period_ticks;
+    s_encoder_single_x100 = angle_x100;
+
+    if((angle_x100 <= STEPPER_ABSOLUTE_MIN_X100) ||
+       (angle_x100 >= STEPPER_ABSOLUTE_MAX_X100))
+    {
+        if(s_encoder_absolute_violation_count <
+            STEPPER_ABSOLUTE_LIMIT_CONFIRM_SAMPLES)
+        {
+            s_encoder_absolute_violation_count ++;
+        }
+    }
+    else
+    {
+        s_encoder_absolute_violation_count = 0U;
     }
 
     s_encoder_feedback_valid = 1;
@@ -1574,12 +1831,14 @@ static void wireless_print_status (void)
     frequency_sign = (s_stepper_frequency_pps < 0) ? '-' : '+';
 
     wireless_debug_printf(
-        "abs=%3u.%02u, rel=%c%u.%02u, target=%c%u.%02u, err=%c%u.%02u, step=%c%upps, en=%u, high=%u, period=%u\r\n",
+        "abs=%3u.%02u, rel=%c%u.%02u, target=%c%u.%02u, err=%c%u.%02u, step=%c%upps, en=%u, fault=%u, age=%u, reject=%u, absbad=%u, high=%u, period=%u\r\n",
         s_encoder_single_x100 / 100U, s_encoder_single_x100 % 100U,
         relative_sign, relative_abs / 100U, relative_abs % 100U,
         target_sign, target_abs / 100U, target_abs % 100U,
         error_sign, error_abs / 100U, error_abs % 100U,
-        frequency_sign, frequency_abs, s_stepper_enabled,
+        frequency_sign, frequency_abs, s_stepper_enabled, s_stepper_fault,
+        s_encoder_feedback_age, s_encoder_rejected_sample_count,
+        s_encoder_absolute_violation_count,
         s_encoder_high_ticks, s_encoder_period_ticks);
 }
 
@@ -1665,6 +1924,7 @@ static void vision_control_print_status (void)
     uint32 relative_abs;
     uint32 angle_target_abs;
     uint32 frequency_abs;
+    uint32 stiction_launch_abs;
     char position_sign;
     char velocity_sign;
     char position_target_sign;
@@ -1675,6 +1935,8 @@ static void vision_control_print_status (void)
     char relative_sign;
     char angle_target_sign;
     char frequency_sign;
+    char stiction_direction;
+    char stiction_launch_sign;
     const char *state;
 
     position_abs = int32_abs_to_uint32(s_camera_position_x100);
@@ -1687,6 +1949,8 @@ static void vision_control_print_status (void)
     relative_abs = int32_abs_to_uint32(s_encoder_total_x100);
     angle_target_abs = int32_abs_to_uint32(s_stepper_target_x100);
     frequency_abs = int32_abs_to_uint32(s_stepper_frequency_pps);
+    stiction_launch_abs =
+        int32_abs_to_uint32(s_speed_stiction_last_launch_angle_x100);
     position_sign = (s_camera_position_x100 < 0) ? '-' : '+';
     velocity_sign = (s_camera_velocity_x100 < 0) ? '-' : '+';
     position_target_sign = (s_ball_target_position_x100 < 0) ? '-' : '+';
@@ -1697,6 +1961,10 @@ static void vision_control_print_status (void)
     relative_sign = (s_encoder_total_x100 < 0) ? '-' : '+';
     angle_target_sign = (s_stepper_target_x100 < 0) ? '-' : '+';
     frequency_sign = (s_stepper_frequency_pps < 0) ? '-' : '+';
+    stiction_direction = (s_speed_stiction_last_direction > 0) ? 'R' :
+        ((s_speed_stiction_last_direction < 0) ? 'L' : '-');
+    stiction_launch_sign =
+        (s_speed_stiction_last_launch_angle_x100 < 0) ? '-' : '+';
     state = s_vision_ball_lost ? "REACQ" : "ACTIVE";
 
     wireless_debug_printf(
@@ -1709,13 +1977,17 @@ static void vision_control_print_status (void)
         velocity_target_sign, velocity_target_abs / 100U, velocity_target_abs % 100U,
         speed_error_sign, speed_error_abs / 100U, speed_error_abs % 100U);
     wireless_debug_printf(
-        "angle_cmd=%c%u.%02u target=%c%u.%02u rel=%c%u.%02u step=%c%u lim=%u/%u cross=%u age=%u\r\n",
+        "angle_cmd=%c%u.%02u target=%c%u.%02u rel=%c%u.%02u step=%c%u lim=%u/%u cross=%u kick=%u/%c/%u events=%u boost=%c%u.%02u retry=%u block=%u age=%u\r\n",
         angle_command_sign, angle_command_abs / 100U, angle_command_abs % 100U,
         angle_target_sign, angle_target_abs / 100U, angle_target_abs % 100U,
         relative_sign, relative_abs / 100U, relative_abs % 100U,
         frequency_sign, frequency_abs, s_position_output_limited,
         s_speed_output_saturated, s_position_target_crossed,
-        s_camera_link_age);
+        s_speed_stiction_active, stiction_direction,
+        s_speed_stiction_active_frames, s_speed_stiction_event_count,
+        stiction_launch_sign, stiction_launch_abs / 100U,
+        stiction_launch_abs % 100U, s_speed_stiction_retry_level,
+        s_speed_stiction_blocked, s_camera_link_age);
 }
 
 static void wireless_print_help (void)
@@ -2147,6 +2419,9 @@ int main (void)
     wireless_debug_printf("Cascade PID: position -> target speed -> beam angle\r\n");
     wireless_debug_printf("Pos Kp=3.50 Ki=0.08 Kd=1.00, vmax=20cm/s, brake=15cm/s2\r\n");
     wireless_debug_printf("Speed Kp=0.80 Ki=0.10 Kd=0.03, angle limit=+/-8deg\r\n");
+    wireless_debug_printf("Fast response: vref accel=200cm/s2, angle slew=1.2/2.0deg/frame\r\n");
+    wireless_debug_printf("Auto stiction: adaptive +/-4.6..6.5deg, step=0.25deg\r\n");
+    wireless_debug_printf("Encoder filter: period+jump check, abs limit requires 5 samples\r\n");
     wireless_debug_printf("Pulse test: visual stop, rel stop +4.4/-4.2deg, max500ms\r\n");
     wireless_debug_printf("Boot: motor/vision OFF. Level -> Z -> E; send V only when ready.\r\n");
     wireless_debug_printf("Limits: target +/-20deg, test trip +/-25deg, absolute 121~208deg\r\n");
