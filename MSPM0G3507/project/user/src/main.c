@@ -172,6 +172,15 @@
 #define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // verify final hold for about 100ms
 #define AUTO_RUN_TIME_LIMIT_MS               (5000U)
 
+// Competition one-button mode uses S1/KEY1 (A30).  A short press captures
+// the physical level zero, enables the driver, waits for the enable snap to
+// settle, arms vision control, and starts A after a hands-off delay.  Holding
+// the same key for one second is always an emergency stop.
+#define COMPETITION_KEY_SCAN_PERIOD_MS        (10U)
+#define COMPETITION_LEVEL_BAND_X100           (15)    // beam settled within +/-0.15deg
+#define COMPETITION_PREP_STABLE_FRAMES        (5U)    // about 100ms at the camera frame rate
+#define COMPETITION_HANDS_OFF_DELAY_MS        (1000U)
+
 #define SPEED_PID_KP_X100                    (80)    // 0.80 deg/(cm/s), strong braking near target
 #define SPEED_PID_KI_X100                    (10)    // 0.10 deg/cm
 #define SPEED_PID_KD_X100                    (3)     // 0.03 deg/(cm/s^2)
@@ -254,6 +263,16 @@ typedef enum
     AUTO_RUN_COMPLETE,
 } auto_run_phase_enum;
 
+typedef enum
+{
+    COMPETITION_IDLE = 0,
+    COMPETITION_WAIT_LEVEL,
+    COMPETITION_WAIT_VISION,
+    COMPETITION_HANDS_OFF,
+    COMPETITION_RUNNING,
+    COMPETITION_COMPLETE,
+} competition_phase_enum;
+
 typedef struct
 {
     uint16 capture_ms;
@@ -307,6 +326,7 @@ static uint8  s_stepper_direction_inverted = 0;
 static stepper_fault_enum s_stepper_fault = STEPPER_FAULT_NONE;
 
 static uint8  s_direction_check_active = 0;
+static uint8  s_direction_check_reference_valid = 0;
 static uint32 s_direction_check_counter = 0;
 static uint32 s_direction_check_reference_error = 0;
 
@@ -376,6 +396,12 @@ static uint16 s_auto_run_right_ms = 0U;
 static int32  s_auto_run_right_position_x100 = 0;
 static uint8  s_auto_run_timeout_reported = 0U;
 static uint8  s_auto_run_final_stable_frames = 0U;
+static competition_phase_enum s_competition_phase = COMPETITION_IDLE;
+static uint8  s_competition_key_long_handled = 0U;
+static uint8  s_competition_sequence_seen = 0U;
+static uint8  s_competition_last_sequence = 0U;
+static uint8  s_competition_stable_frames = 0U;
+static uint16 s_competition_hands_off_start_ms = 0U;
 
 static int32  s_speed_error_x100 = 0;
 static int32  s_speed_p_term_x100 = 0;
@@ -1634,6 +1660,7 @@ static void stepper_disable_output (void)
     gpio_low(STEPPER_EN_PIN);
     s_stepper_enabled = 0;
     s_direction_check_active = 0;
+    s_direction_check_reference_valid = 0;
 }
 
 static void stepper_trip (stepper_fault_enum fault, const char *message)
@@ -1651,9 +1678,13 @@ static void stepper_trip (stepper_fault_enum fault, const char *message)
 static void stepper_start_direction_check (void)
 {
     s_direction_check_active = 1;
+    // The rotor may snap to the nearest electrical detent as EN rises.  That
+    // motion is not caused by a STEP pulse and must not become the reference
+    // for polarity checking.  Capture the baseline when the first real STEP
+    // command is applied instead.
+    s_direction_check_reference_valid = 0;
     s_direction_check_counter = 0;
-    s_direction_check_reference_error =
-        int32_abs_to_uint32(s_stepper_target_x100 - s_encoder_total_x100);
+    s_direction_check_reference_error = 0U;
 }
 
 static void manual_pulse_start (int8 direction)
@@ -2133,24 +2164,44 @@ static void stepper_control_update (void)
 
     if(s_direction_check_active && (0 != next_frequency))
     {
-        s_direction_check_counter ++;
-        if(s_direction_check_counter >= STEPPER_DIRECTION_CHECK_LOOPS)
+        if(!s_direction_check_reference_valid)
         {
-            if(absolute_error >
-               (s_direction_check_reference_error + STEPPER_DIRECTION_ERROR_X100))
-            {
-                stepper_trip(STEPPER_FAULT_DIRECTION,
-                    "angle moved away from target; send I while disabled");
-                return;
-            }
-
-            s_direction_check_counter = 0;
             s_direction_check_reference_error = absolute_error;
-            if(absolute_error <= (STEPPER_POSITION_DEADBAND_X100 + 10U))
+            s_direction_check_reference_valid = 1U;
+            s_direction_check_counter = 0U;
+        }
+        else
+        {
+            s_direction_check_counter ++;
+            if(s_direction_check_counter >= STEPPER_DIRECTION_CHECK_LOOPS)
             {
-                s_direction_check_active = 0;
+                if(absolute_error >
+                   (s_direction_check_reference_error + STEPPER_DIRECTION_ERROR_X100))
+                {
+                    stepper_trip(STEPPER_FAULT_DIRECTION,
+                        "angle moved away from target; send I while disabled");
+                    return;
+                }
+
+                s_direction_check_counter = 0U;
+                s_direction_check_reference_error = absolute_error;
+                if(absolute_error <= (STEPPER_POSITION_DEADBAND_X100 + 10U))
+                {
+                    s_direction_check_active = 0U;
+                    s_direction_check_reference_valid = 0U;
+                }
             }
         }
+    }
+    else if(s_direction_check_active && s_direction_check_reference_valid &&
+            (absolute_error <= (STEPPER_POSITION_DEADBAND_X100 + 10U)))
+    {
+        // A short correction can finish before the 50ms direction window.
+        // Close that check now so its old baseline cannot affect a later
+        // target command.
+        s_direction_check_active = 0U;
+        s_direction_check_reference_valid = 0U;
+        s_direction_check_counter = 0U;
     }
 }
 
@@ -2720,6 +2771,7 @@ static void wireless_print_help (void)
     wireless_debug_printf("          X+5/X-5/X0=ball target(cm); T+10/T-10/T0=manual angle\r\n");
     wireless_debug_printf("          A=auto O->+5cm->-5cm; endpoints<=1cm, total<=5s\r\n");
     wireless_debug_printf("          D1=25Hz RAM log ON; after test send S then D0 to dump CSV\r\n");
+    wireless_debug_printf("S1: short=one-button competition start; hold 1s=emergency stop\r\n");
 }
 
 static void wireless_execute_command (const char *command)
@@ -3193,6 +3245,262 @@ static void wireless_accept_character (uint8 character)
     }
 }
 
+static void competition_prepare_reset (void)
+{
+    s_competition_sequence_seen = 1U;
+    s_competition_last_sequence = s_camera_sequence;
+    s_competition_stable_frames = 0U;
+    s_competition_hands_off_start_ms = 0U;
+}
+
+static uint8 competition_camera_origin_valid (void)
+{
+    return ((s_camera_link_age <= VISION_LINK_TIMEOUT_LOOPS) &&
+            s_camera_measurement_valid &&
+            (int32_abs_to_uint32(s_camera_position_x100) <=
+                AUTO_RUN_START_POSITION_X100) &&
+            (int32_abs_to_uint32(s_camera_velocity_x100) <=
+                AUTO_RUN_START_SPEED_X100)) ? 1U : 0U;
+}
+
+static uint8 competition_new_camera_frame (void)
+{
+    if((!s_competition_sequence_seen) ||
+       (s_camera_sequence != s_competition_last_sequence))
+    {
+        s_competition_sequence_seen = 1U;
+        s_competition_last_sequence = s_camera_sequence;
+        return 1U;
+    }
+    return 0U;
+}
+
+static void competition_start_from_button (void)
+{
+    if(COMPETITION_IDLE != s_competition_phase)
+    {
+        wireless_debug_printf(
+            "S1 ignored: competition sequence is already active; hold S1 to stop\r\n");
+        return;
+    }
+    if(s_stepper_enabled)
+    {
+        wireless_debug_printf(
+            "S1 rejected: motor is already enabled; hold S1 to stop first\r\n");
+        return;
+    }
+    if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok) ||
+       (s_encoder_feedback_age > STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+    {
+        wireless_debug_printf("S1 rejected: encoder PWM is not valid\r\n");
+        return;
+    }
+    if(!competition_camera_origin_valid())
+    {
+        wireless_debug_printf(
+            "S1 rejected: camera invalid or ball not still within O +/-0.50cm\r\n");
+        return;
+    }
+
+    // The operator has physically levelled the beam.  Reuse the tested
+    // command paths so serial and button operation have identical guards.
+    wireless_execute_command("Z");
+    if(!s_stepper_zero_set)
+    {
+        return;
+    }
+    wireless_execute_command("X0");
+    wireless_execute_command("E");
+    if(!s_stepper_enabled)
+    {
+        return;
+    }
+
+    s_competition_phase = COMPETITION_WAIT_LEVEL;
+    competition_prepare_reset();
+    wireless_debug_printf(
+        "S1 PREP: zero captured; waiting for enable snap to return level\r\n");
+}
+
+static void competition_button_update (void)
+{
+    key_state_enum key_state;
+    uint8 new_camera_frame;
+    uint16 hands_off_elapsed_ms;
+
+    key_state = key_get_state(KEY_1);
+    if(KEY_LONG_PRESS == key_state)
+    {
+        if(!s_competition_key_long_handled)
+        {
+            s_competition_key_long_handled = 1U;
+            wireless_execute_command("S");
+            s_competition_phase = COMPETITION_IDLE;
+            competition_prepare_reset();
+            wireless_debug_printf("S1 EMERGENCY STOP\r\n");
+        }
+        return;
+    }
+    if(KEY_RELEASE == key_state)
+    {
+        s_competition_key_long_handled = 0U;
+    }
+    else if(KEY_SHORT_PRESS == key_state)
+    {
+        key_clear_state(KEY_1);
+        competition_start_from_button();
+        return;
+    }
+
+    new_camera_frame = competition_new_camera_frame();
+    switch(s_competition_phase)
+    {
+        case COMPETITION_WAIT_LEVEL:
+        {
+            if(!s_stepper_enabled)
+            {
+                s_competition_phase = COMPETITION_IDLE;
+                wireless_debug_printf(
+                    "S1 PREP ABORTED: motor disabled or safety fault\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if(competition_camera_origin_valid() &&
+               (int32_abs_to_uint32(s_encoder_total_x100) <=
+                    COMPETITION_LEVEL_BAND_X100) &&
+               (0 == s_stepper_frequency_pps))
+            {
+                if(s_competition_stable_frames <
+                    COMPETITION_PREP_STABLE_FRAMES)
+                {
+                    s_competition_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_competition_stable_frames = 0U;
+            }
+
+            if(s_competition_stable_frames >=
+               COMPETITION_PREP_STABLE_FRAMES)
+            {
+                wireless_execute_command("V");
+                if(s_vision_control_active)
+                {
+                    s_competition_phase = COMPETITION_WAIT_VISION;
+                    competition_prepare_reset();
+                    wireless_debug_printf(
+                        "S1 PREP: level stable; waiting for vision ACTIVE\r\n");
+                }
+                else
+                {
+                    s_competition_phase = COMPETITION_IDLE;
+                    wireless_debug_printf("S1 PREP ABORTED: vision arm rejected\r\n");
+                }
+            }
+        }break;
+
+        case COMPETITION_WAIT_VISION:
+        {
+            if((!s_stepper_enabled) || (!s_vision_control_active))
+            {
+                s_competition_phase = COMPETITION_IDLE;
+                wireless_debug_printf("S1 PREP ABORTED: vision/motor stopped\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if((!s_vision_ball_lost) && competition_camera_origin_valid())
+            {
+                if(s_competition_stable_frames <
+                    COMPETITION_PREP_STABLE_FRAMES)
+                {
+                    s_competition_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_competition_stable_frames = 0U;
+            }
+
+            if(s_competition_stable_frames >=
+               COMPETITION_PREP_STABLE_FRAMES)
+            {
+                s_competition_phase = COMPETITION_HANDS_OFF;
+                s_competition_hands_off_start_ms =
+                    s_camera_capture_ms_low16;
+                wireless_debug_printf(
+                    "S1 READY: hands off; auto starts in 1000ms\r\n");
+            }
+        }break;
+
+        case COMPETITION_HANDS_OFF:
+        {
+            if((!s_stepper_enabled) || (!s_vision_control_active))
+            {
+                s_competition_phase = COMPETITION_IDLE;
+                wireless_debug_printf("S1 PREP ABORTED: vision/motor stopped\r\n");
+                break;
+            }
+            if(new_camera_frame &&
+               ((!s_vision_ball_lost) && competition_camera_origin_valid()))
+            {
+                hands_off_elapsed_ms = (uint16)(s_camera_capture_ms_low16 -
+                    s_competition_hands_off_start_ms);
+                if(hands_off_elapsed_ms >= COMPETITION_HANDS_OFF_DELAY_MS)
+                {
+                    wireless_execute_command("A");
+                    if(AUTO_RUN_TO_RIGHT == s_auto_run_phase)
+                    {
+                        s_competition_phase = COMPETITION_RUNNING;
+                        wireless_debug_printf(
+                            "S1 RUNNING: no more key presses required\r\n");
+                    }
+                    else
+                    {
+                        s_competition_phase = COMPETITION_IDLE;
+                        wireless_debug_printf("S1 PREP ABORTED: auto start rejected\r\n");
+                    }
+                }
+            }
+            else if(new_camera_frame)
+            {
+                s_competition_phase = COMPETITION_WAIT_VISION;
+                competition_prepare_reset();
+                wireless_debug_printf(
+                    "S1 WAIT: ball moved before start; waiting at O again\r\n");
+            }
+        }break;
+
+        case COMPETITION_RUNNING:
+        {
+            if(AUTO_RUN_COMPLETE == s_auto_run_phase)
+            {
+                s_competition_phase = COMPETITION_COMPLETE;
+                wireless_debug_printf(
+                    "S1 COMPLETE: holding final -5cm position; hold S1 to stop\r\n");
+            }
+            else if((AUTO_RUN_TO_RIGHT != s_auto_run_phase) &&
+                    (AUTO_RUN_TO_LEFT != s_auto_run_phase))
+            {
+                s_competition_phase = COMPETITION_IDLE;
+                wireless_debug_printf("S1 RUN ABORTED\r\n");
+            }
+        }break;
+
+        case COMPETITION_IDLE:
+        case COMPETITION_COMPLETE:
+        default:
+        {
+        }break;
+    }
+}
+
 int main (void)
 {
     uint32 high_ticks;
@@ -3202,6 +3510,7 @@ int main (void)
     uint32 wireless_rx_length;
     uint32 wireless_rx_index;
     uint32 status_counter = 0;
+    uint32 key_scan_counter = 0;
     uint8 valid_sample_this_loop;
 
     clock_init(SYSTEM_CLOCK_80M);   // 时钟配置及系统初始化<务必保留>
@@ -3222,6 +3531,7 @@ int main (void)
 
     camera_uart_init();
     ms42_pwm_capture_init();
+    key_init(COMPETITION_KEY_SCAN_PERIOD_MS);
     interrupt_global_enable(0);
 
     wireless_debug_printf("\r\nMS42CG encoder + D36A angle-loop test\r\n");
@@ -3245,7 +3555,8 @@ int main (void)
     wireless_debug_printf("Auto stiction: adaptive +/-4.6..6.5deg, step=0.25deg\r\n");
     wireless_debug_printf("Encoder filter: period+jump check, abs limit requires 5 samples\r\n");
     wireless_debug_printf("Pulse test: visual stop, rel stop +4.4/-4.2deg, max500ms\r\n");
-    wireless_debug_printf("Boot: motor/vision OFF. Level -> Z -> E; send V only when ready.\r\n");
+    wireless_debug_printf("Boot: motor/vision OFF. Competition: level + ball at O, short S1 once.\r\n");
+    wireless_debug_printf("S1 waits for level/vision, then starts O->+5->-5; hold 1s=STOP.\r\n");
     wireless_debug_printf("Limits: target +/-20deg, test trip +/-25deg, absolute 121~208deg\r\n");
     wireless_print_help();
 
@@ -3297,6 +3608,13 @@ int main (void)
         {
             s_camera_link_age ++;
         }
+        key_scan_counter ++;
+        if(key_scan_counter >= COMPETITION_KEY_SCAN_PERIOD_MS)
+        {
+            key_scan_counter = 0U;
+            key_scanner();
+        }
+        competition_button_update();
         vision_control_update();
         manual_pulse_update();
 
