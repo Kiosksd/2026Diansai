@@ -110,21 +110,50 @@
 #define CAMERA_RX_RING_SIZE                  (128U)
 #define CAMERA_RX_RING_MASK                  (CAMERA_RX_RING_SIZE - 1U)
 #define CAMERA_LINK_TIMEOUT_LOOPS            (300U)
-#define CAMERA_NOMINAL_FRAME_PERIOD_MS       (20U)
+#define CAMERA_NOMINAL_FRAME_PERIOD_MS       (20U)   // 50Hz vision input; actual packet timestamp supplies PID dt
 
 // 串级双环 PID：位置外环输出目标球速，速度内环输出摆杆目标角。
 // 所有量均使用 x100 定点数：位置 cm、速度 cm/s、角度 deg。
 // 正球速表示向右；机构实测正摆角使球向左，因此速度环输出到摆角时需要反号。
-#define POSITION_PID_KP_X100                 (350)   // 3.50 (cm/s)/cm
-#define POSITION_PID_KI_X100                 (8)     // 0.08 (cm/s)/(cm*s)
-#define POSITION_PID_KD_RIGHT_X100           (30)    // X+: 0.30, measured-distance braking is dominant
-#define POSITION_PID_KD_LEFT_X100            (40)    // generic X- profile remains independent of S1
-#define S1_POSITION_PID_KD_LEFT_X100         (55)    // fixed S1 profile brakes earlier before its final range
-#define POSITION_PID_I_LIMIT_X100            (200)   // 目标速度积分项 +/-2.00cm/s
-#define POSITION_PID_SPEED_LIMIT_X100        (2000)  // 最大目标球速 +/-20.00cm/s
+#define GENERIC_POSITION_PID_KP_X100         (600)   // 8926ff0 profile: 3.50 (cm/s)/cm
+#define GENERIC_POSITION_PID_KI_X100         (8)     // 8926ff0 profile: 0.08 (cm/s)/(cm*s)
+#define GENERIC_POSITION_PID_KD_RIGHT_X100   (200)   // 8926ff0 profile: 1.00 in both directions
+#define GENERIC_POSITION_PID_KD_LEFT_X100    (200)
+#define GENERIC_POSITION_PID_I_LIMIT_X100    (200)   // target-speed integral term +/-2.00cm/s
+#define GENERIC_POSITION_PID_SPEED_LIMIT_X100 (2000) // target-ball-speed limit +/-20.00cm/s
+#define GENERIC_POSITION_BRAKE_RIGHT_X100    (1500)  // 8926ff0 braking planner: 15.00cm/s^2
+#define GENERIC_POSITION_BRAKE_LEFT_X100     (1500)
+
+// KEY1 competition parameters are deliberately duplicated instead of aliased
+// to the generic profile.  Future tuning of another task must not change S1.
+#define S1_POSITION_PID_KP_X100              (350)
+#define S1_POSITION_PID_KI_X100              (8)
+#define S1_POSITION_PID_KD_RIGHT_X100        (30)
+#define S1_POSITION_PID_KD_LEFT_X100         (55)
+#define S1_POSITION_PID_I_LIMIT_X100         (200)
+#define S1_POSITION_PID_SPEED_LIMIT_X100     (2000)
+#define S1_POSITION_BRAKE_RIGHT_X100         (900)
+#define S1_POSITION_BRAKE_LEFT_X100          (1500)
+
+// Preserve the exact pre-run/abort behavior that the current KEY1 code used
+// before its dedicated final-run profile was selected.
+#define S1_PREP_POSITION_PID_KD_RIGHT_X100   (30)
+#define S1_PREP_POSITION_PID_KD_LEFT_X100    (40)
+#define S1_PREP_POSITION_BRAKE_RIGHT_X100    (900)
+#define S1_PREP_POSITION_BRAKE_LEFT_X100     (1500)
+
+// S2/KEY2 (A31) center-hold profile.  Keep it independent so later center
+// tuning cannot change the fixed S1 competition trajectory.
+#define S2_POSITION_PID_KP_X100              (350)
+#define S2_POSITION_PID_KI_X100              (8)
+#define S2_POSITION_PID_KD_RIGHT_X100        (30)
+#define S2_POSITION_PID_KD_LEFT_X100         (100)
+#define S2_POSITION_PID_I_LIMIT_X100         (200)
+#define S2_POSITION_PID_SPEED_LIMIT_X100     (2000)
+#define S2_POSITION_BRAKE_RIGHT_X100         (900)
+#define S2_POSITION_BRAKE_LEFT_X100          (1500)
+
 #define POSITION_SPEED_ACCEL_X100_PER_S      (20000) // 目标球速加速斜率 200.00cm/s^2
-#define POSITION_BRAKE_ACCEL_RIGHT_X100      (900)   // X+: measured effective braking about 9.00cm/s^2
-#define POSITION_BRAKE_ACCEL_LEFT_X100       (1500)  // X-: retain proven 15.00cm/s^2 planner
 #define POSITION_SETTLE_BAND_X100            (8)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
 #define POSITION_LANDING_ARM_DISTANCE_X100   (200)   // use landing capture only after travel of at least 2.00cm
@@ -152,7 +181,7 @@
 #define POSITION_HOLD_RIGHT_TRIM_MAX_X100    (540)   // bounded adaptive trim ceiling
 #define POSITION_HOLD_RIGHT_TRIM_DISTANCE_X100 (5)   // withdraw each trim after 0.05cm rightward motion
 #define POSITION_HOLD_RIGHT_TRIM_SPEED_X100  (30)    // or after rightward speed reaches 0.30cm/s
-#define POSITION_HOLD_RIGHT_TRIM_FRAMES      (12U)   // hard limit about 240ms per trim
+#define POSITION_HOLD_RIGHT_TRIM_FRAMES      (12U)   // hard limit about 240ms per trim at 50Hz
 #define POSITION_HOLD_RIGHT_TRIM_COOLDOWN_FRAMES (5U) // allow braking/vision to settle for about 100ms
 #define POSITION_HOLD_RIGHT_TRIM_MAX_ATTEMPTS (16U)  // enough 0.05cm steps for a measured 0.45cm recovery
 #define POSITION_HOLD_RIGHT_SUPPORT_I_X100   (250)   // seed the proven near-3.5deg support after a trim moves
@@ -193,42 +222,55 @@
 #define AUTO_FINAL_RECOVERY_MAX_X100         (800)
 #define AUTO_FINAL_RECOVERY_RELEASE_X100     (5)     // withdraw after 0.05cm leftward displacement
 #define AUTO_FINAL_RECOVERY_SPEED_X100       (30)
-#define AUTO_FINAL_RECOVERY_ACTIVE_FRAMES    (12U)   // each launch is limited to about 240ms
-#define AUTO_FINAL_RECOVERY_COOLDOWN_FRAMES  (4U)
+#define AUTO_FINAL_RECOVERY_ACTIVE_FRAMES    (12U)   // each launch is limited to about 240ms at 50Hz
+#define AUTO_FINAL_RECOVERY_COOLDOWN_FRAMES  (4U)    // about 80ms at 50Hz
 #define AUTO_RUN_START_POSITION_X100         (50)    // require start within +/-0.50cm of O
 #define AUTO_RUN_START_SPEED_X100            (50)    // require start below 0.50cm/s
 #define AUTO_RUN_ENDPOINT_ERROR_X100         (100)   // both endpoints must be within +/-1.00cm
 #define AUTO_RUN_FINAL_SPEED_X100            (50)    // generic A point target: below 0.50cm/s
-#define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // generic A point target: about 100ms
+#define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // generic A point target: about 100ms at 50Hz
 #define S1_AUTO_RUN_FINAL_SPEED_X100         (30)    // S1 range must be quiet below 0.30cm/s
-#define S1_AUTO_RUN_FINAL_STABLE_FRAMES      (8U)    // verify the S1 range for about 160ms
+#define S1_AUTO_RUN_FINAL_STABLE_FRAMES      (8U)    // verify the S1 range for about 160ms at 50Hz
 #define AUTO_RUN_TIME_LIMIT_MS               (5000U)
 
-// Competition one-button mode uses S1/KEY1 (A30).  A short press captures
-// the physical level zero, enables the driver, waits for the enable snap to
-// settle, arms vision control, and starts A after a hands-off delay.  Holding
-// the same key for one second is always an emergency stop.
+// S1/KEY1 (A30) runs the fixed competition task. S2/KEY2 (A31) uses the same
+// safe zero/enable/vision preparation and then holds the ball at O. Holding
+// either key for one second is an emergency stop.
 #define COMPETITION_KEY_SCAN_PERIOD_MS        (10U)
 #define COMPETITION_LEVEL_BAND_X100           (15)    // beam settled within +/-0.15deg
-#define COMPETITION_PREP_STABLE_FRAMES        (5U)    // about 100ms at the camera frame rate
+#define COMPETITION_PREP_STABLE_FRAMES        (5U)    // about 100ms at the 50Hz camera frame rate
 #define COMPETITION_HANDS_OFF_DELAY_MS        (400U)   // short release/move-away margin after S1
 
-#define SPEED_PID_KP_X100                    (80)    // 0.80 deg/(cm/s), strong braking near target
-#define SPEED_PID_KI_X100                    (10)    // 0.10 deg/cm
-#define SPEED_PID_KD_X100                    (3)     // 0.03 deg/(cm/s^2)
-#define SPEED_PID_I_LIMIT_X100               (250)   // 速度环积分项 +/-2.50deg
-#define SPEED_PID_ACCEL_LIMIT_X100           (5000)  // D项加速度输入限制 +/-50.00cm/s^2
-#define SPEED_PID_POSITIVE_ANGLE_LIMIT_X100  (800)   // 小球向X负方向时横梁最高 +8.00deg
-#define SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100  (800)   // 小球向X正方向时横梁最低 -8.00deg
+#define GENERIC_SPEED_PID_KP_X100            (110)    // 8926ff0 speed-loop profile
+#define GENERIC_SPEED_PID_KI_X100            (10)
+#define GENERIC_SPEED_PID_KD_X100            (3)
+#define GENERIC_SPEED_PID_I_LIMIT_X100       (250)
+#define GENERIC_SPEED_PID_ACCEL_LIMIT_X100   (5000)
+#define GENERIC_SPEED_PID_POS_ANGLE_X100     (800)
+#define GENERIC_SPEED_PID_NEG_ANGLE_X100     (800)
+
+#define S1_SPEED_PID_KP_X100                 (80)    // fixed KEY1 competition profile
+#define S1_SPEED_PID_KI_X100                 (10)
+#define S1_SPEED_PID_KD_X100                 (3)
+#define S1_SPEED_PID_I_LIMIT_X100            (250)
+#define S1_SPEED_PID_ACCEL_LIMIT_X100        (5000)
+#define S1_SPEED_PID_POS_ANGLE_X100          (800)
+#define S1_SPEED_PID_NEG_ANGLE_X100          (800)
+
+#define S2_SPEED_PID_KP_X100                 (100)
+#define S2_SPEED_PID_KI_X100                 (10)
+#define S2_SPEED_PID_KD_X100                 (5)
+#define S2_SPEED_PID_I_LIMIT_X100            (250)
+#define S2_SPEED_PID_ACCEL_LIMIT_X100        (5000)
+#define S2_SPEED_PID_POS_ANGLE_X100          (800)
+#define S2_SPEED_PID_NEG_ANGLE_X100          (800)
 #define SPEED_SETTLE_BAND_X100               (15)    // 速度稳定带 +/-0.15cm/s
 
 #define PID_INTEGRAL_SCALE                   (100000)
-#define POSITION_PID_I_ACCUM_LIMIT           (POSITION_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE)
-#define SPEED_PID_I_ACCUM_LIMIT              (SPEED_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE)
 
 // 加速时平缓改变摆角；需要制动时允许更快地反向倾斜。
-#define VISION_ACCEL_ANGLE_SLEW_X100         (120)   // 1.20deg per camera frame
-#define VISION_BRAKE_ANGLE_SLEW_X100         (200)   // 2.00deg per camera frame
+#define VISION_ACCEL_ANGLE_SLEW_X100         (120)   // 1.20deg/frame gives the proven 60deg/s at 50Hz
+#define VISION_BRAKE_ANGLE_SLEW_X100         (200)   // 2.00deg/frame gives about 100deg/s at 50Hz
 #define VISION_POSITION_LIMIT_X100           (1200)  // calibrated useful range +/-12.00cm
 #define VISION_VELOCITY_LIMIT_X100           (5000)  // reject implausible values above 50.00cm/s
 #define VISION_TARGET_POSITION_LIMIT_X100    (1000)  // target range +/-10.00cm
@@ -304,6 +346,127 @@ typedef enum
     COMPETITION_RUNNING,
     COMPETITION_COMPLETE,
 } competition_phase_enum;
+
+typedef enum
+{
+    CENTER_HOLD_IDLE = 0,
+    CENTER_HOLD_WAIT_LEVEL,
+    CENTER_HOLD_WAIT_VISION,
+    CENTER_HOLD_ACTIVE,
+} center_hold_phase_enum;
+
+// Top-level ownership of the shared camera, cascade controller and stepper.
+// KEY1 always owns APP_CONTROL_KEY1_FIXED; the original 8926ff0 controller is
+// retained as APP_CONTROL_GENERIC_8926 for serial commands and future tasks.
+typedef enum
+{
+    APP_CONTROL_IDLE = 0,
+    APP_CONTROL_GENERIC_8926,
+    APP_CONTROL_KEY1_FIXED,
+    APP_CONTROL_KEY2_CENTER,
+} app_control_mode_enum;
+
+typedef enum
+{
+    CASCADE_PROFILE_GENERIC_8926 = 0,
+    CASCADE_PROFILE_KEY1_FIXED,
+    CASCADE_PROFILE_KEY2_CENTER,
+} cascade_profile_enum;
+
+typedef struct
+{
+    int32 position_kp_x100;
+    int32 position_ki_x100;
+    int32 position_kd_right_x100;
+    int32 position_kd_left_x100;
+    int32 position_i_limit_x100;
+    int32 position_speed_limit_x100;
+    int32 position_brake_right_x100;
+    int32 position_brake_left_x100;
+    int32 speed_kp_x100;
+    int32 speed_ki_x100;
+    int32 speed_kd_x100;
+    int32 speed_i_limit_x100;
+    int32 speed_accel_limit_x100;
+    int32 speed_positive_angle_limit_x100;
+    int32 speed_negative_angle_limit_x100;
+} cascade_pid_profile_struct;
+
+static const cascade_pid_profile_struct s_pid_profile_generic_8926 =
+{
+    GENERIC_POSITION_PID_KP_X100,
+    GENERIC_POSITION_PID_KI_X100,
+    GENERIC_POSITION_PID_KD_RIGHT_X100,
+    GENERIC_POSITION_PID_KD_LEFT_X100,
+    GENERIC_POSITION_PID_I_LIMIT_X100,
+    GENERIC_POSITION_PID_SPEED_LIMIT_X100,
+    GENERIC_POSITION_BRAKE_RIGHT_X100,
+    GENERIC_POSITION_BRAKE_LEFT_X100,
+    GENERIC_SPEED_PID_KP_X100,
+    GENERIC_SPEED_PID_KI_X100,
+    GENERIC_SPEED_PID_KD_X100,
+    GENERIC_SPEED_PID_I_LIMIT_X100,
+    GENERIC_SPEED_PID_ACCEL_LIMIT_X100,
+    GENERIC_SPEED_PID_POS_ANGLE_X100,
+    GENERIC_SPEED_PID_NEG_ANGLE_X100,
+};
+
+static const cascade_pid_profile_struct s_pid_profile_key1_fixed =
+{
+    S1_POSITION_PID_KP_X100,
+    S1_POSITION_PID_KI_X100,
+    S1_POSITION_PID_KD_RIGHT_X100,
+    S1_POSITION_PID_KD_LEFT_X100,
+    S1_POSITION_PID_I_LIMIT_X100,
+    S1_POSITION_PID_SPEED_LIMIT_X100,
+    S1_POSITION_BRAKE_RIGHT_X100,
+    S1_POSITION_BRAKE_LEFT_X100,
+    S1_SPEED_PID_KP_X100,
+    S1_SPEED_PID_KI_X100,
+    S1_SPEED_PID_KD_X100,
+    S1_SPEED_PID_I_LIMIT_X100,
+    S1_SPEED_PID_ACCEL_LIMIT_X100,
+    S1_SPEED_PID_POS_ANGLE_X100,
+    S1_SPEED_PID_NEG_ANGLE_X100,
+};
+
+static const cascade_pid_profile_struct s_pid_profile_key1_prep =
+{
+    S1_POSITION_PID_KP_X100,
+    S1_POSITION_PID_KI_X100,
+    S1_PREP_POSITION_PID_KD_RIGHT_X100,
+    S1_PREP_POSITION_PID_KD_LEFT_X100,
+    S1_POSITION_PID_I_LIMIT_X100,
+    S1_POSITION_PID_SPEED_LIMIT_X100,
+    S1_PREP_POSITION_BRAKE_RIGHT_X100,
+    S1_PREP_POSITION_BRAKE_LEFT_X100,
+    S1_SPEED_PID_KP_X100,
+    S1_SPEED_PID_KI_X100,
+    S1_SPEED_PID_KD_X100,
+    S1_SPEED_PID_I_LIMIT_X100,
+    S1_SPEED_PID_ACCEL_LIMIT_X100,
+    S1_SPEED_PID_POS_ANGLE_X100,
+    S1_SPEED_PID_NEG_ANGLE_X100,
+};
+
+static const cascade_pid_profile_struct s_pid_profile_key2_center =
+{
+    S2_POSITION_PID_KP_X100,
+    S2_POSITION_PID_KI_X100,
+    S2_POSITION_PID_KD_RIGHT_X100,
+    S2_POSITION_PID_KD_LEFT_X100,
+    S2_POSITION_PID_I_LIMIT_X100,
+    S2_POSITION_PID_SPEED_LIMIT_X100,
+    S2_POSITION_BRAKE_RIGHT_X100,
+    S2_POSITION_BRAKE_LEFT_X100,
+    S2_SPEED_PID_KP_X100,
+    S2_SPEED_PID_KI_X100,
+    S2_SPEED_PID_KD_X100,
+    S2_SPEED_PID_I_LIMIT_X100,
+    S2_SPEED_PID_ACCEL_LIMIT_X100,
+    S2_SPEED_PID_POS_ANGLE_X100,
+    S2_SPEED_PID_NEG_ANGLE_X100,
+};
 
 typedef struct
 {
@@ -438,7 +601,8 @@ static uint16 s_auto_run_right_ms = 0U;
 static int32  s_auto_run_right_position_x100 = 0;
 static uint8  s_auto_run_timeout_reported = 0U;
 static uint8  s_auto_run_final_stable_frames = 0U;
-static uint8  s_auto_run_s1_profile = 0U;
+static app_control_mode_enum s_app_control_mode = APP_CONTROL_IDLE;
+static cascade_profile_enum s_cascade_profile = CASCADE_PROFILE_GENERIC_8926;
 static uint8  s_auto_final_range_active = 0U;
 static uint8  s_auto_final_range_seen = 0U;
 static uint8  s_auto_final_far_guard_active = 0U;
@@ -456,6 +620,11 @@ static uint8  s_competition_sequence_seen = 0U;
 static uint8  s_competition_last_sequence = 0U;
 static uint8  s_competition_stable_frames = 0U;
 static uint16 s_competition_hands_off_start_ms = 0U;
+static center_hold_phase_enum s_center_hold_phase = CENTER_HOLD_IDLE;
+static uint8  s_center_hold_key_long_handled = 0U;
+static uint8  s_center_hold_sequence_seen = 0U;
+static uint8  s_center_hold_last_sequence = 0U;
+static uint8  s_center_hold_stable_frames = 0U;
 
 static int32  s_speed_error_x100 = 0;
 static int32  s_speed_p_term_x100 = 0;
@@ -488,6 +657,29 @@ static uint8  s_manual_pulse_last_sequence = 0;
 static manual_pulse_phase_enum s_manual_pulse_phase = MANUAL_PULSE_PHASE_IDLE;
 static uint32 s_manual_pulse_ramp_loops = 0;
 static uint32 s_manual_pulse_hold_counter = 0;
+
+static uint8 cascade_profile_is_key1_fixed (void)
+{
+    return (CASCADE_PROFILE_KEY1_FIXED == s_cascade_profile) ? 1U : 0U;
+}
+
+static const cascade_pid_profile_struct *cascade_pid_profile_get (void)
+{
+    if(cascade_profile_is_key1_fixed())
+    {
+        return &s_pid_profile_key1_fixed;
+    }
+    if((CASCADE_PROFILE_KEY2_CENTER == s_cascade_profile) ||
+       (APP_CONTROL_KEY2_CENTER == s_app_control_mode))
+    {
+        return &s_pid_profile_key2_center;
+    }
+    if(APP_CONTROL_KEY1_FIXED == s_app_control_mode)
+    {
+        return &s_pid_profile_key1_prep;
+    }
+    return &s_pid_profile_generic_8926;
+}
 
 //-------------------------------------------------------------------------------------------------------------------
 // 函数简介     将格式化调试信息统一通过无线串口模块发送
@@ -832,7 +1024,7 @@ static void auto_run_cancel (void)
     s_auto_run_right_position_x100 = 0;
     s_auto_run_timeout_reported = 0U;
     s_auto_run_final_stable_frames = 0U;
-    s_auto_run_s1_profile = 0U;
+    s_cascade_profile = CASCADE_PROFILE_GENERIC_8926;
     s_auto_final_range_active = 0U;
     s_auto_final_range_seen = 0U;
     s_auto_final_far_guard_active = 0U;
@@ -1075,8 +1267,280 @@ static void speed_stiction_update (uint32 error_abs, uint32 velocity_abs)
 // 函数简介     串级双环 PID：位置 PID -> 目标球速，速度 PID -> 目标摆角
 // 备注信息     仅在收到新视觉帧时调用；距离制动曲线和过零检测用于抑制冲过目标点
 //-------------------------------------------------------------------------------------------------------------------
-static void cascade_pid_update (void)
+// Original 8926ff0 cascade controller.  It intentionally has no landing
+// capture/final-range logic from later competition tuning.  Serial X/V and
+// future non-KEY1 tasks use this path with their own PID profile.
+static void cascade_pid_update_generic_8926 (void)
 {
+    const cascade_pid_profile_struct *pid_profile =
+        &s_pid_profile_generic_8926;
+    uint16 delta_ms;
+    uint32 error_abs;
+    uint32 velocity_abs;
+    uint32 brake_speed_x100;
+    int32 candidate_accumulator;
+    int32 command_without_new_i;
+    int32 desired_velocity_x100;
+    int32 target_velocity_delta_x100;
+    int32 max_velocity_increase_x100;
+    int32 raw_accel_x100;
+    int32 speed_effort_x100;
+    int32 speed_integral_angle_limit_x100;
+    int32 desired_angle_x100;
+    int32 target_angle_delta_x100;
+    int32 angle_slew_limit_x100;
+    uint8 position_integral_allowed;
+    uint8 speed_integral_allowed;
+    uint8 settled;
+
+    if(!s_cascade_time_seen)
+    {
+        delta_ms = CAMERA_NOMINAL_FRAME_PERIOD_MS;
+        s_cascade_time_seen = 1U;
+        s_speed_last_velocity_x100 = s_camera_velocity_x100;
+    }
+    else
+    {
+        delta_ms = (uint16)(s_camera_capture_ms_low16 -
+            s_cascade_last_capture_ms);
+        if(delta_ms < 5U)
+        {
+            delta_ms = 5U;
+        }
+        else if(delta_ms > 50U)
+        {
+            delta_ms = 50U;
+        }
+    }
+    s_cascade_last_capture_ms = s_camera_capture_ms_low16;
+
+    s_position_error_x100 = s_ball_target_position_x100 -
+        s_camera_position_x100;
+    error_abs = int32_abs_to_uint32(s_position_error_x100);
+    velocity_abs = int32_abs_to_uint32(s_camera_velocity_x100);
+    settled = ((error_abs <= POSITION_SETTLE_BAND_X100) &&
+        (velocity_abs <= SPEED_SETTLE_BAND_X100)) ? 1U : 0U;
+
+    s_position_target_crossed = 0U;
+    if(s_position_error_seen &&
+       (((s_position_previous_error_x100 > 0) &&
+            (s_position_error_x100 < 0)) ||
+        ((s_position_previous_error_x100 < 0) &&
+            (s_position_error_x100 > 0))))
+    {
+        s_position_target_crossed = 1U;
+        s_position_i_accumulator = 0;
+        s_position_i_term_x100 = 0;
+        s_speed_i_accumulator = 0;
+        s_speed_i_term_x100 = 0;
+        s_ball_target_velocity_x100 = 0;
+    }
+    if(0 != s_position_error_x100)
+    {
+        s_position_previous_error_x100 = s_position_error_x100;
+        s_position_error_seen = 1U;
+    }
+
+    s_position_p_term_x100 =
+        (s_position_error_x100 * pid_profile->position_kp_x100) / 100;
+    s_position_d_term_x100 =
+        -(s_camera_velocity_x100 * pid_profile->position_kd_right_x100) /
+            100;
+
+    brake_speed_x100 = integer_sqrt_u64(
+        (uint64)2U * pid_profile->position_brake_right_x100 * error_abs);
+    if(brake_speed_x100 >
+       (uint32)pid_profile->position_speed_limit_x100)
+    {
+        brake_speed_x100 =
+            (uint32)pid_profile->position_speed_limit_x100;
+    }
+
+    command_without_new_i = s_position_p_term_x100 +
+        s_position_i_term_x100 + s_position_d_term_x100;
+    position_integral_allowed =
+        (error_abs > POSITION_INTEGRAL_FREEZE_X100) &&
+        (int32_abs_to_uint32(command_without_new_i) <
+            (uint32)pid_profile->position_speed_limit_x100) &&
+        (int32_abs_to_uint32(command_without_new_i) < brake_speed_x100) &&
+        (((s_position_error_x100 > 0) && (command_without_new_i >= 0)) ||
+         ((s_position_error_x100 < 0) && (command_without_new_i <= 0)));
+
+    if(position_integral_allowed)
+    {
+        candidate_accumulator = s_position_i_accumulator +
+            s_position_error_x100 * pid_profile->position_ki_x100 *
+                (int32)delta_ms;
+        s_position_i_accumulator = int32_clamp(candidate_accumulator,
+            -(pid_profile->position_i_limit_x100 * PID_INTEGRAL_SCALE),
+            pid_profile->position_i_limit_x100 * PID_INTEGRAL_SCALE);
+        s_position_i_term_x100 =
+            s_position_i_accumulator / PID_INTEGRAL_SCALE;
+    }
+
+    desired_velocity_x100 = s_position_p_term_x100 +
+        s_position_i_term_x100 + s_position_d_term_x100;
+    s_position_output_limited = 0U;
+    if(settled || s_position_target_crossed ||
+       (error_abs <= POSITION_SETTLE_BAND_X100))
+    {
+        desired_velocity_x100 = 0;
+        s_position_i_accumulator = 0;
+        s_position_i_term_x100 = 0;
+    }
+    else if(s_position_error_x100 > 0)
+    {
+        if(desired_velocity_x100 < 0)
+        {
+            desired_velocity_x100 = 0;
+            s_position_output_limited = 1U;
+        }
+        if(desired_velocity_x100 > (int32)brake_speed_x100)
+        {
+            desired_velocity_x100 = (int32)brake_speed_x100;
+            s_position_output_limited = 1U;
+        }
+    }
+    else
+    {
+        if(desired_velocity_x100 > 0)
+        {
+            desired_velocity_x100 = 0;
+            s_position_output_limited = 1U;
+        }
+        if(desired_velocity_x100 < -(int32)brake_speed_x100)
+        {
+            desired_velocity_x100 = -(int32)brake_speed_x100;
+            s_position_output_limited = 1U;
+        }
+    }
+    desired_velocity_x100 = int32_clamp(desired_velocity_x100,
+        -pid_profile->position_speed_limit_x100,
+        pid_profile->position_speed_limit_x100);
+
+    if((desired_velocity_x100 * s_ball_target_velocity_x100) < 0)
+    {
+        s_ball_target_velocity_x100 = 0;
+    }
+    else if(int32_abs_to_uint32(desired_velocity_x100) >
+            int32_abs_to_uint32(s_ball_target_velocity_x100))
+    {
+        max_velocity_increase_x100 =
+            (POSITION_SPEED_ACCEL_X100_PER_S * (int32)delta_ms) / 1000;
+        if(max_velocity_increase_x100 < 1)
+        {
+            max_velocity_increase_x100 = 1;
+        }
+        target_velocity_delta_x100 = desired_velocity_x100 -
+            s_ball_target_velocity_x100;
+        target_velocity_delta_x100 = int32_clamp(target_velocity_delta_x100,
+            -max_velocity_increase_x100, max_velocity_increase_x100);
+        s_ball_target_velocity_x100 += target_velocity_delta_x100;
+    }
+    else
+    {
+        s_ball_target_velocity_x100 = desired_velocity_x100;
+    }
+
+    speed_stiction_update(error_abs, velocity_abs);
+
+    raw_accel_x100 = ((s_camera_velocity_x100 -
+        s_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
+    raw_accel_x100 = int32_clamp(raw_accel_x100,
+        -pid_profile->speed_accel_limit_x100,
+        pid_profile->speed_accel_limit_x100);
+    s_speed_filtered_accel_x100 +=
+        (raw_accel_x100 - s_speed_filtered_accel_x100) / 4;
+    s_speed_last_velocity_x100 = s_camera_velocity_x100;
+
+    s_speed_error_x100 = s_ball_target_velocity_x100 -
+        s_camera_velocity_x100;
+    s_speed_p_term_x100 =
+        (s_speed_error_x100 * pid_profile->speed_kp_x100) / 100;
+    s_speed_d_term_x100 =
+        -(s_speed_filtered_accel_x100 * pid_profile->speed_kd_x100) / 100;
+
+    command_without_new_i = s_speed_p_term_x100 +
+        s_speed_i_term_x100 + s_speed_d_term_x100;
+    speed_integral_angle_limit_x100 = (command_without_new_i < 0) ?
+        pid_profile->speed_positive_angle_limit_x100 :
+        pid_profile->speed_negative_angle_limit_x100;
+    speed_integral_allowed = (!settled) &&
+        (!s_speed_stiction_active) &&
+        (int32_abs_to_uint32(command_without_new_i) <
+            (uint32)speed_integral_angle_limit_x100);
+    if(speed_integral_allowed)
+    {
+        candidate_accumulator = s_speed_i_accumulator +
+            s_speed_error_x100 * pid_profile->speed_ki_x100 *
+                (int32)delta_ms;
+        s_speed_i_accumulator = int32_clamp(candidate_accumulator,
+            -(pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE),
+            pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE);
+        s_speed_i_term_x100 = s_speed_i_accumulator / PID_INTEGRAL_SCALE;
+    }
+
+    if(settled)
+    {
+        s_speed_i_accumulator = 0;
+        s_speed_i_term_x100 = 0;
+        speed_effort_x100 = 0;
+    }
+    else
+    {
+        speed_effort_x100 = s_speed_p_term_x100 +
+            s_speed_i_term_x100 + s_speed_d_term_x100;
+    }
+
+    desired_angle_x100 = -speed_effort_x100;
+    if(s_speed_stiction_active)
+    {
+        if((s_speed_stiction_direction > 0) &&
+           (desired_angle_x100 > s_speed_stiction_launch_angle_x100))
+        {
+            desired_angle_x100 = s_speed_stiction_launch_angle_x100;
+        }
+        else if((s_speed_stiction_direction < 0) &&
+                (desired_angle_x100 < s_speed_stiction_launch_angle_x100))
+        {
+            desired_angle_x100 = s_speed_stiction_launch_angle_x100;
+        }
+    }
+    s_speed_output_saturated = 0U;
+    if(desired_angle_x100 > pid_profile->speed_positive_angle_limit_x100)
+    {
+        desired_angle_x100 = pid_profile->speed_positive_angle_limit_x100;
+        s_speed_output_saturated = 1U;
+    }
+    else if(desired_angle_x100 <
+            -pid_profile->speed_negative_angle_limit_x100)
+    {
+        desired_angle_x100 =
+            -pid_profile->speed_negative_angle_limit_x100;
+        s_speed_output_saturated = 1U;
+    }
+    s_vision_angle_command_x100 = desired_angle_x100;
+
+    if(((desired_angle_x100 * s_camera_velocity_x100) > 0) ||
+       (int32_abs_to_uint32(s_ball_target_velocity_x100) < velocity_abs) ||
+       s_position_target_crossed)
+    {
+        angle_slew_limit_x100 = VISION_BRAKE_ANGLE_SLEW_X100;
+    }
+    else
+    {
+        angle_slew_limit_x100 = VISION_ACCEL_ANGLE_SLEW_X100;
+    }
+    target_angle_delta_x100 = desired_angle_x100 - s_stepper_target_x100;
+    target_angle_delta_x100 = int32_clamp(target_angle_delta_x100,
+        -angle_slew_limit_x100, angle_slew_limit_x100);
+    s_stepper_target_x100 += target_angle_delta_x100;
+    s_direction_check_active = 0U;
+}
+
+static void cascade_pid_update_enhanced (void)
+{
+    const cascade_pid_profile_struct *pid_profile;
     uint16 delta_ms;
     uint32 error_abs;
     uint32 velocity_abs;
@@ -1108,6 +1572,8 @@ static void cascade_pid_update (void)
     int32 landing_trim_max_x100;
     int32 auto_final_recovery_displacement_x100;
 
+    pid_profile = cascade_pid_profile_get();
+
     if(!s_cascade_time_seen)
     {
         delta_ms = CAMERA_NOMINAL_FRAME_PERIOD_MS;
@@ -1137,7 +1603,7 @@ static void cascade_pid_update (void)
     // The S1 left endpoint is an accepted range, not a mathematical point.
     // After the first entry, this dedicated controller owns the endpoint both
     // inside and outside the range so the old catch/trim state cannot re-enter.
-    if(s_auto_run_s1_profile &&
+    if(cascade_profile_is_key1_fixed() &&
        ((AUTO_RUN_TO_LEFT == s_auto_run_phase) ||
         ((AUTO_RUN_COMPLETE == s_auto_run_phase) &&
          s_auto_final_range_seen)))
@@ -1632,7 +2098,8 @@ static void cascade_pid_update (void)
         raw_accel_x100 = ((s_camera_velocity_x100 -
             s_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
         raw_accel_x100 = int32_clamp(raw_accel_x100,
-            -SPEED_PID_ACCEL_LIMIT_X100, SPEED_PID_ACCEL_LIMIT_X100);
+            -pid_profile->speed_accel_limit_x100,
+            pid_profile->speed_accel_limit_x100);
         s_speed_filtered_accel_x100 +=
             (raw_accel_x100 - s_speed_filtered_accel_x100) / 4;
         s_speed_last_velocity_x100 = s_camera_velocity_x100;
@@ -1640,18 +2107,20 @@ static void cascade_pid_update (void)
         s_speed_error_x100 = s_ball_target_velocity_x100 -
             s_camera_velocity_x100;
         s_speed_p_term_x100 =
-            (s_speed_error_x100 * SPEED_PID_KP_X100) / 100;
+            (s_speed_error_x100 * pid_profile->speed_kp_x100) / 100;
         s_speed_d_term_x100 =
-            -(s_speed_filtered_accel_x100 * SPEED_PID_KD_X100) / 100;
+            -(s_speed_filtered_accel_x100 * pid_profile->speed_kd_x100) / 100;
         command_without_new_i = s_speed_p_term_x100 +
             s_speed_i_term_x100 + s_speed_d_term_x100;
         if(int32_abs_to_uint32(command_without_new_i) <
             POSITION_HOLD_ANGLE_LIMIT_X100)
         {
             candidate_accumulator = s_speed_i_accumulator +
-                s_speed_error_x100 * SPEED_PID_KI_X100 * (int32)delta_ms;
+                s_speed_error_x100 * pid_profile->speed_ki_x100 *
+                    (int32)delta_ms;
             s_speed_i_accumulator = int32_clamp(candidate_accumulator,
-                -SPEED_PID_I_ACCUM_LIMIT, SPEED_PID_I_ACCUM_LIMIT);
+                -(pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE),
+                pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE);
             s_speed_i_term_x100 =
                 s_speed_i_accumulator / PID_INTEGRAL_SCALE;
         }
@@ -1752,20 +2221,16 @@ static void cascade_pid_update (void)
     }
 
     s_position_p_term_x100 =
-        (s_position_error_x100 * POSITION_PID_KP_X100) / 100;
+        (s_position_error_x100 * pid_profile->position_kp_x100) / 100;
     if(s_position_error_x100 >= 0)
     {
-        position_kd_x100 = POSITION_PID_KD_RIGHT_X100;
-        brake_accel_x100 = POSITION_BRAKE_ACCEL_RIGHT_X100;
+        position_kd_x100 = pid_profile->position_kd_right_x100;
+        brake_accel_x100 = pid_profile->position_brake_right_x100;
     }
     else
     {
-        position_kd_x100 =
-            (s_auto_run_s1_profile &&
-             (AUTO_RUN_TO_LEFT == s_auto_run_phase)) ?
-                S1_POSITION_PID_KD_LEFT_X100 :
-                POSITION_PID_KD_LEFT_X100;
-        brake_accel_x100 = POSITION_BRAKE_ACCEL_LEFT_X100;
+        position_kd_x100 = pid_profile->position_kd_left_x100;
+        brake_accel_x100 = pid_profile->position_brake_left_x100;
     }
     // Derivative on measurement avoids a target-change derivative kick.
     s_position_d_term_x100 =
@@ -1773,9 +2238,11 @@ static void cascade_pid_update (void)
 
     brake_speed_x100 = integer_sqrt_u64(
         (uint64)2U * brake_accel_x100 * error_abs);
-    if(brake_speed_x100 > POSITION_PID_SPEED_LIMIT_X100)
+    if(brake_speed_x100 >
+       (uint32)pid_profile->position_speed_limit_x100)
     {
-        brake_speed_x100 = POSITION_PID_SPEED_LIMIT_X100;
+        brake_speed_x100 =
+            (uint32)pid_profile->position_speed_limit_x100;
     }
 
     command_without_new_i = s_position_p_term_x100 +
@@ -1783,7 +2250,7 @@ static void cascade_pid_update (void)
     position_integral_allowed =
         (error_abs > POSITION_INTEGRAL_FREEZE_X100) &&
         (int32_abs_to_uint32(command_without_new_i) <
-            POSITION_PID_SPEED_LIMIT_X100) &&
+            (uint32)pid_profile->position_speed_limit_x100) &&
         (int32_abs_to_uint32(command_without_new_i) < brake_speed_x100) &&
         (((s_position_error_x100 > 0) && (command_without_new_i >= 0)) ||
          ((s_position_error_x100 < 0) && (command_without_new_i <= 0)));
@@ -1791,9 +2258,11 @@ static void cascade_pid_update (void)
     if(position_integral_allowed)
     {
         candidate_accumulator = s_position_i_accumulator +
-            s_position_error_x100 * POSITION_PID_KI_X100 * (int32)delta_ms;
+            s_position_error_x100 * pid_profile->position_ki_x100 *
+                (int32)delta_ms;
         s_position_i_accumulator = int32_clamp(candidate_accumulator,
-            -POSITION_PID_I_ACCUM_LIMIT, POSITION_PID_I_ACCUM_LIMIT);
+            -(pid_profile->position_i_limit_x100 * PID_INTEGRAL_SCALE),
+            pid_profile->position_i_limit_x100 * PID_INTEGRAL_SCALE);
         s_position_i_term_x100 =
             s_position_i_accumulator / PID_INTEGRAL_SCALE;
     }
@@ -1835,7 +2304,8 @@ static void cascade_pid_update (void)
         }
     }
     desired_velocity_x100 = int32_clamp(desired_velocity_x100,
-        -POSITION_PID_SPEED_LIMIT_X100, POSITION_PID_SPEED_LIMIT_X100);
+        -pid_profile->position_speed_limit_x100,
+        pid_profile->position_speed_limit_x100);
 
     // Acceleration is ramped, but reductions in target speed take effect at once.
     // A requested direction reversal first commands zero for one vision frame.
@@ -1868,7 +2338,8 @@ static void cascade_pid_update (void)
     raw_accel_x100 = ((s_camera_velocity_x100 -
         s_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
     raw_accel_x100 = int32_clamp(raw_accel_x100,
-        -SPEED_PID_ACCEL_LIMIT_X100, SPEED_PID_ACCEL_LIMIT_X100);
+        -pid_profile->speed_accel_limit_x100,
+        pid_profile->speed_accel_limit_x100);
     s_speed_filtered_accel_x100 +=
         (raw_accel_x100 - s_speed_filtered_accel_x100) / 4;
     s_speed_last_velocity_x100 = s_camera_velocity_x100;
@@ -1876,17 +2347,17 @@ static void cascade_pid_update (void)
     s_speed_error_x100 = s_ball_target_velocity_x100 -
         s_camera_velocity_x100;
     s_speed_p_term_x100 =
-        (s_speed_error_x100 * SPEED_PID_KP_X100) / 100;
+        (s_speed_error_x100 * pid_profile->speed_kp_x100) / 100;
     s_speed_d_term_x100 =
-        -(s_speed_filtered_accel_x100 * SPEED_PID_KD_X100) / 100;
+        -(s_speed_filtered_accel_x100 * pid_profile->speed_kd_x100) / 100;
 
     command_without_new_i = s_speed_p_term_x100 +
         s_speed_i_term_x100 + s_speed_d_term_x100;
     // speed_effort and beam angle have opposite signs: negative effort
     // produces the positive beam angle used for motion toward X-.
     speed_integral_angle_limit_x100 = (command_without_new_i < 0) ?
-        SPEED_PID_POSITIVE_ANGLE_LIMIT_X100 :
-        SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100;
+        pid_profile->speed_positive_angle_limit_x100 :
+        pid_profile->speed_negative_angle_limit_x100;
     speed_integral_allowed = (!settled) &&
         (!s_speed_stiction_active) &&
         (int32_abs_to_uint32(command_without_new_i) <
@@ -1894,9 +2365,11 @@ static void cascade_pid_update (void)
     if(speed_integral_allowed)
     {
         candidate_accumulator = s_speed_i_accumulator +
-            s_speed_error_x100 * SPEED_PID_KI_X100 * (int32)delta_ms;
+            s_speed_error_x100 * pid_profile->speed_ki_x100 *
+                (int32)delta_ms;
         s_speed_i_accumulator = int32_clamp(candidate_accumulator,
-            -SPEED_PID_I_ACCUM_LIMIT, SPEED_PID_I_ACCUM_LIMIT);
+            -(pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE),
+            pid_profile->speed_i_limit_x100 * PID_INTEGRAL_SCALE);
         s_speed_i_term_x100 = s_speed_i_accumulator / PID_INTEGRAL_SCALE;
     }
 
@@ -1928,14 +2401,16 @@ static void cascade_pid_update (void)
         }
     }
     s_speed_output_saturated = 0U;
-    if(desired_angle_x100 > SPEED_PID_POSITIVE_ANGLE_LIMIT_X100)
+    if(desired_angle_x100 > pid_profile->speed_positive_angle_limit_x100)
     {
-        desired_angle_x100 = SPEED_PID_POSITIVE_ANGLE_LIMIT_X100;
+        desired_angle_x100 = pid_profile->speed_positive_angle_limit_x100;
         s_speed_output_saturated = 1U;
     }
-    else if(desired_angle_x100 < -SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100)
+    else if(desired_angle_x100 <
+            -pid_profile->speed_negative_angle_limit_x100)
     {
-        desired_angle_x100 = -SPEED_PID_NEGATIVE_ANGLE_LIMIT_X100;
+        desired_angle_x100 =
+            -pid_profile->speed_negative_angle_limit_x100;
         s_speed_output_saturated = 1U;
     }
     s_vision_angle_command_x100 = desired_angle_x100;
@@ -1957,6 +2432,19 @@ static void cascade_pid_update (void)
         -angle_slew_limit_x100, angle_slew_limit_x100);
     s_stepper_target_x100 += target_angle_delta_x100;
     s_direction_check_active = 0U;
+}
+
+static void cascade_pid_update (void)
+{
+    if((APP_CONTROL_KEY1_FIXED == s_app_control_mode) ||
+       (APP_CONTROL_KEY2_CENTER == s_app_control_mode))
+    {
+        cascade_pid_update_enhanced();
+    }
+    else
+    {
+        cascade_pid_update_generic_8926();
+    }
 }
 
 static void camera_uart_init (void)
@@ -2069,6 +2557,7 @@ static void stepper_disable_output (void)
 static void stepper_trip (stepper_fault_enum fault, const char *message)
 {
     auto_run_cancel();
+    s_app_control_mode = APP_CONTROL_IDLE;
     s_vision_control_active = 0U;
     s_vision_ball_lost = 1U;
     s_manual_pulse_active = 0U;
@@ -2303,6 +2792,7 @@ static void vision_command_level (uint8 start_direction_check)
 static void vision_control_stop_to_level (const char *reason)
 {
     auto_run_cancel();
+    s_app_control_mode = APP_CONTROL_IDLE;
     s_vision_control_active = 0U;
     s_vision_ball_lost = 1U;
     s_vision_sequence_seen = 0U;
@@ -2331,15 +2821,15 @@ static void auto_run_update (void)
     }
 
     elapsed_ms = auto_run_elapsed_ms();
-    final_speed_limit_x100 = s_auto_run_s1_profile ?
+    final_speed_limit_x100 = cascade_profile_is_key1_fixed() ?
         S1_AUTO_RUN_FINAL_SPEED_X100 : AUTO_RUN_FINAL_SPEED_X100;
-    final_stable_required = s_auto_run_s1_profile ?
+    final_stable_required = cascade_profile_is_key1_fixed() ?
         S1_AUTO_RUN_FINAL_STABLE_FRAMES : AUTO_RUN_FINAL_STABLE_FRAMES;
     if((elapsed_ms > AUTO_RUN_TIME_LIMIT_MS) &&
        (!s_auto_run_timeout_reported))
     {
         s_auto_run_timeout_reported = 1U;
-        if(s_auto_run_s1_profile)
+        if(cascade_profile_is_key1_fixed())
         {
             wireless_debug_printf(
                 "S1 TIME LIMIT EXCEEDED: %ums; control continues to left range\r\n",
@@ -2357,12 +2847,18 @@ static void auto_run_update (void)
     {
         endpoint_error_abs = int32_abs_to_uint32(
             AUTO_RUN_RIGHT_TARGET_X100 - s_camera_position_x100);
-        if(s_landing_hold_active &&
-           (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100))
+        endpoint_stable = cascade_profile_is_key1_fixed() ?
+            (s_landing_hold_active &&
+             (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100)) :
+            ((endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100) &&
+             (int32_abs_to_uint32(s_camera_velocity_x100) <=
+                AUTO_RUN_FINAL_SPEED_X100) &&
+             (!s_speed_stiction_active));
+        if(endpoint_stable)
         {
             s_auto_run_right_ms = elapsed_ms;
             s_auto_run_right_position_x100 = s_camera_position_x100;
-            if(s_auto_run_s1_profile)
+            if(cascade_profile_is_key1_fixed())
             {
                 wireless_debug_printf(
                     "S1 TURN: x=+%u.%02ucm err=%u.%02ucm t=%ums; target=-5.20cm range=-6.00..-4.50cm\r\n",
@@ -2381,7 +2877,7 @@ static void auto_run_update (void)
                     elapsed_ms);
             }
             s_auto_run_phase = AUTO_RUN_TO_LEFT;
-            s_ball_target_position_x100 = s_auto_run_s1_profile ?
+            s_ball_target_position_x100 = cascade_profile_is_key1_fixed() ?
                 S1_AUTO_RUN_LEFT_TARGET_X100 : AUTO_RUN_LEFT_TARGET_X100;
             s_auto_final_range_active = 0U;
             s_auto_final_range_seen = 0U;
@@ -2403,7 +2899,7 @@ static void auto_run_update (void)
 
     endpoint_error_abs = int32_abs_to_uint32(
         AUTO_RUN_LEFT_NOMINAL_X100 - s_camera_position_x100);
-    if(s_auto_run_s1_profile)
+    if(cascade_profile_is_key1_fixed())
     {
         endpoint_stable = s_auto_final_range_active &&
             (s_camera_position_x100 >= AUTO_FINAL_RANGE_FAR_X100) &&
@@ -2414,13 +2910,11 @@ static void auto_run_update (void)
     }
     else
     {
-        endpoint_stable = s_landing_hold_active &&
+        endpoint_stable =
             (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100) &&
             (int32_abs_to_uint32(s_camera_velocity_x100) <=
                 final_speed_limit_x100) &&
-            (0U == s_landing_catch_frames_remaining) &&
-            (0U == s_landing_trim_active) &&
-            (0U == s_landing_ceiling_guard_active);
+            (!s_speed_stiction_active);
     }
     if(endpoint_stable)
     {
@@ -2442,7 +2936,7 @@ static void auto_run_update (void)
                 s_auto_run_right_position_x100);
         result_pass = ((elapsed_ms <= AUTO_RUN_TIME_LIMIT_MS) &&
             (right_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100) &&
-            (s_auto_run_s1_profile ?
+            (cascade_profile_is_key1_fixed() ?
                 ((s_camera_position_x100 >= AUTO_FINAL_RANGE_FAR_X100) &&
                  (s_camera_position_x100 <= AUTO_FINAL_RANGE_NEAR_X100)) :
                 (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100))) ? 1U : 0U;
@@ -2465,6 +2959,7 @@ static void vision_control_update (void)
 
     if(!s_stepper_enabled)
     {
+        s_app_control_mode = APP_CONTROL_IDLE;
         s_vision_control_active = 0U;
         s_vision_ball_lost = 1U;
         cascade_pid_reset();
@@ -3346,9 +3841,9 @@ static void wireless_print_help (void)
     wireless_debug_printf("Commands: Z=zero(level), E=enable, V=vision ON, M=manual/level\r\n");
     wireless_debug_printf("          P+=right pulse, P-=left pulse; motion/angle/max500ms stop\r\n");
     wireless_debug_printf("          X+5/X-5/X0=ball target(cm); T+10/T-10/T0=manual angle\r\n");
-    wireless_debug_printf("          A=generic auto O->+5cm->-5cm; S1=fixed competition profile\r\n");
+    wireless_debug_printf("          A=generic auto; S1=fixed competition; S2=hold O\r\n");
     wireless_debug_printf("          D1=25Hz RAM log ON; after test send S then D0 to dump CSV\r\n");
-    wireless_debug_printf("S1: short=one-button competition start; hold 1s=emergency stop\r\n");
+    wireless_debug_printf("S1 short=fixed task; S2 short=hold O; hold either 1s=STOP\r\n");
 }
 
 static void wireless_execute_command (const char *command)
@@ -3434,6 +3929,8 @@ static void wireless_execute_command (const char *command)
         case 'S':
         {
             auto_run_cancel();
+            s_app_control_mode = APP_CONTROL_IDLE;
+            s_competition_phase = COMPETITION_IDLE;
             s_vision_control_active = 0U;
             s_vision_ball_lost = 1U;
             s_manual_pulse_active = 0U;
@@ -3517,6 +4014,11 @@ static void wireless_execute_command (const char *command)
             else
             {
                 auto_run_cancel();
+                if((APP_CONTROL_KEY1_FIXED != s_app_control_mode) &&
+                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+                {
+                    s_app_control_mode = APP_CONTROL_GENERIC_8926;
+                }
                 s_ball_target_position_x100 = requested_target;
                 cascade_pid_reset();
                 if(s_vision_control_active)
@@ -3570,7 +4072,11 @@ static void wireless_execute_command (const char *command)
             else
             {
                 auto_run_cancel();
-                s_auto_run_s1_profile = s1_profile_requested;
+                s_app_control_mode = s1_profile_requested ?
+                    APP_CONTROL_KEY1_FIXED : APP_CONTROL_GENERIC_8926;
+                s_cascade_profile = s1_profile_requested ?
+                    CASCADE_PROFILE_KEY1_FIXED :
+                    CASCADE_PROFILE_GENERIC_8926;
                 s_auto_run_phase = AUTO_RUN_TO_RIGHT;
                 s_auto_run_start_ms = s_camera_capture_ms_low16;
                 s_ball_target_position_x100 =
@@ -3578,7 +4084,7 @@ static void wireless_execute_command (const char *command)
                 cascade_pid_reset();
                 s_vision_sequence_seen = 1U;
                 s_vision_last_sequence = s_camera_sequence;
-                if(s_auto_run_s1_profile)
+                if(cascade_profile_is_key1_fixed())
                 {
                     wireless_debug_printf(
                         "S1 START: fixed O->+5.00cm->left range, aim=-5.20cm, limit=5000ms\r\n");
@@ -3693,6 +4199,11 @@ static void wireless_execute_command (const char *command)
             else
             {
                 auto_run_cancel();
+                if((APP_CONTROL_KEY1_FIXED != s_app_control_mode) &&
+                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+                {
+                    s_app_control_mode = APP_CONTROL_GENERIC_8926;
+                }
                 vision_command_level(0U);
                 s_vision_control_active = 1U;
                 s_vision_ball_lost = 1U;
@@ -3711,6 +4222,7 @@ static void wireless_execute_command (const char *command)
         case 'M':
         {
             auto_run_cancel();
+            s_app_control_mode = APP_CONTROL_IDLE;
             s_vision_control_active = 0U;
             s_vision_ball_lost = 1U;
             s_vision_sequence_seen = 0U;
@@ -3893,15 +4405,18 @@ static void competition_start_from_button (void)
 
     // The operator has physically levelled the beam.  Reuse the tested
     // command paths so serial and button operation have identical guards.
+    s_app_control_mode = APP_CONTROL_KEY1_FIXED;
     wireless_execute_command("Z");
     if(!s_stepper_zero_set)
     {
+        s_app_control_mode = APP_CONTROL_IDLE;
         return;
     }
     wireless_execute_command("X0");
     wireless_execute_command("E");
     if(!s_stepper_enabled)
     {
+        s_app_control_mode = APP_CONTROL_IDLE;
         return;
     }
 
@@ -3949,6 +4464,7 @@ static void competition_button_update (void)
             if(!s_stepper_enabled)
             {
                 s_competition_phase = COMPETITION_IDLE;
+                s_app_control_mode = APP_CONTROL_IDLE;
                 wireless_debug_printf(
                     "S1 PREP ABORTED: motor disabled or safety fault\r\n");
                 break;
@@ -3987,6 +4503,7 @@ static void competition_button_update (void)
                 else
                 {
                     s_competition_phase = COMPETITION_IDLE;
+                    s_app_control_mode = APP_CONTROL_IDLE;
                     wireless_debug_printf("S1 PREP ABORTED: vision arm rejected\r\n");
                 }
             }
@@ -3997,6 +4514,7 @@ static void competition_button_update (void)
             if((!s_stepper_enabled) || (!s_vision_control_active))
             {
                 s_competition_phase = COMPETITION_IDLE;
+                s_app_control_mode = APP_CONTROL_IDLE;
                 wireless_debug_printf("S1 PREP ABORTED: vision/motor stopped\r\n");
                 break;
             }
@@ -4034,6 +4552,7 @@ static void competition_button_update (void)
             if((!s_stepper_enabled) || (!s_vision_control_active))
             {
                 s_competition_phase = COMPETITION_IDLE;
+                s_app_control_mode = APP_CONTROL_IDLE;
                 wireless_debug_printf("S1 PREP ABORTED: vision/motor stopped\r\n");
                 break;
             }
@@ -4054,6 +4573,7 @@ static void competition_button_update (void)
                     else
                     {
                         s_competition_phase = COMPETITION_IDLE;
+                        s_app_control_mode = APP_CONTROL_IDLE;
                         wireless_debug_printf("S1 PREP ABORTED: auto start rejected\r\n");
                     }
                 }
@@ -4073,18 +4593,273 @@ static void competition_button_update (void)
             {
                 s_competition_phase = COMPETITION_COMPLETE;
                 wireless_debug_printf(
-                    "S1 COMPLETE: holding -6.00..-4.50cm range; hold S1 to stop\r\n");
+                    "S1 COMPLETE: holding -6.00..-4.50cm range; hold S1/S2 to stop\r\n");
             }
             else if((AUTO_RUN_TO_RIGHT != s_auto_run_phase) &&
                     (AUTO_RUN_TO_LEFT != s_auto_run_phase))
             {
                 s_competition_phase = COMPETITION_IDLE;
+                s_app_control_mode = APP_CONTROL_IDLE;
                 wireless_debug_printf("S1 RUN ABORTED\r\n");
             }
         }break;
 
         case COMPETITION_IDLE:
         case COMPETITION_COMPLETE:
+        default:
+        {
+        }break;
+    }
+}
+
+static void center_hold_prepare_reset (void)
+{
+    s_center_hold_sequence_seen = 1U;
+    s_center_hold_last_sequence = s_camera_sequence;
+    s_center_hold_stable_frames = 0U;
+}
+
+static void center_hold_state_reset (void)
+{
+    s_center_hold_phase = CENTER_HOLD_IDLE;
+    center_hold_prepare_reset();
+    if(APP_CONTROL_KEY2_CENTER == s_app_control_mode)
+    {
+        s_app_control_mode = APP_CONTROL_IDLE;
+    }
+    if(CASCADE_PROFILE_KEY2_CENTER == s_cascade_profile)
+    {
+        s_cascade_profile = CASCADE_PROFILE_GENERIC_8926;
+    }
+}
+
+static uint8 center_hold_new_camera_frame (void)
+{
+    if((!s_center_hold_sequence_seen) ||
+       (s_camera_sequence != s_center_hold_last_sequence))
+    {
+        s_center_hold_sequence_seen = 1U;
+        s_center_hold_last_sequence = s_camera_sequence;
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint8 center_hold_camera_start_valid (void)
+{
+    return ((s_camera_link_age <= VISION_LINK_TIMEOUT_LOOPS) &&
+            s_camera_measurement_valid &&
+            (int32_abs_to_uint32(s_camera_position_x100) <=
+                VISION_POSITION_LIMIT_X100) &&
+            (int32_abs_to_uint32(s_camera_velocity_x100) <=
+                AUTO_RUN_START_SPEED_X100)) ? 1U : 0U;
+}
+
+static void center_hold_start_from_button (void)
+{
+    if(CENTER_HOLD_IDLE != s_center_hold_phase)
+    {
+        wireless_debug_printf(
+            "S2 ignored: center hold is already active; hold S2 to stop\r\n");
+        return;
+    }
+    if((COMPETITION_IDLE != s_competition_phase) ||
+       (APP_CONTROL_KEY1_FIXED == s_app_control_mode))
+    {
+        wireless_debug_printf(
+            "S2 ignored: S1 sequence is active; hold S1/S2 to stop\r\n");
+        return;
+    }
+    if(s_stepper_enabled || s_vision_control_active)
+    {
+        wireless_debug_printf(
+            "S2 rejected: motor/vision is already active; send S first\r\n");
+        return;
+    }
+    if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok) ||
+       (s_encoder_feedback_age > STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+    {
+        wireless_debug_printf("S2 rejected: encoder PWM is not valid\r\n");
+        return;
+    }
+    if(!center_hold_camera_start_valid())
+    {
+        wireless_debug_printf(
+            "S2 rejected: camera invalid or ball is not still on the rail\r\n");
+        return;
+    }
+
+    s_app_control_mode = APP_CONTROL_KEY2_CENTER;
+    wireless_execute_command("Z");
+    if(!s_stepper_zero_set)
+    {
+        center_hold_state_reset();
+        return;
+    }
+    wireless_execute_command("X0");
+    wireless_execute_command("E");
+    if(!s_stepper_enabled)
+    {
+        center_hold_state_reset();
+        return;
+    }
+
+    s_center_hold_phase = CENTER_HOLD_WAIT_LEVEL;
+    center_hold_prepare_reset();
+    wireless_debug_printf(
+        "S2 PREP: zero captured; waiting for enable snap to return level\r\n");
+}
+
+static void center_hold_button_update (void)
+{
+    key_state_enum key_state;
+    uint8 new_camera_frame;
+
+    key_state = key_get_state(KEY_2);
+    if(KEY_LONG_PRESS == key_state)
+    {
+        if(!s_center_hold_key_long_handled)
+        {
+            s_center_hold_key_long_handled = 1U;
+            wireless_execute_command("S");
+            center_hold_state_reset();
+            wireless_debug_printf("S2 EMERGENCY STOP\r\n");
+        }
+        return;
+    }
+    if(KEY_RELEASE == key_state)
+    {
+        s_center_hold_key_long_handled = 0U;
+    }
+    else if(KEY_SHORT_PRESS == key_state)
+    {
+        key_clear_state(KEY_2);
+        center_hold_start_from_button();
+        return;
+    }
+
+    new_camera_frame = center_hold_new_camera_frame();
+    switch(s_center_hold_phase)
+    {
+        case CENTER_HOLD_WAIT_LEVEL:
+        {
+            if((!s_stepper_enabled) ||
+               (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+            {
+                center_hold_state_reset();
+                wireless_debug_printf(
+                    "S2 PREP ABORTED: motor disabled or mode changed\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if(center_hold_camera_start_valid() &&
+               (int32_abs_to_uint32(s_encoder_total_x100) <=
+                    COMPETITION_LEVEL_BAND_X100) &&
+               (0 == s_stepper_frequency_pps))
+            {
+                if(s_center_hold_stable_frames <
+                   COMPETITION_PREP_STABLE_FRAMES)
+                {
+                    s_center_hold_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_center_hold_stable_frames = 0U;
+            }
+
+            if(s_center_hold_stable_frames >=
+               COMPETITION_PREP_STABLE_FRAMES)
+            {
+                wireless_execute_command("V");
+                if(s_vision_control_active)
+                {
+                    s_center_hold_phase = CENTER_HOLD_WAIT_VISION;
+                    center_hold_prepare_reset();
+                    wireless_debug_printf(
+                        "S2 PREP: level stable; waiting for vision ACTIVE\r\n");
+                }
+                else
+                {
+                    center_hold_state_reset();
+                    wireless_debug_printf(
+                        "S2 PREP ABORTED: vision arm rejected\r\n");
+                }
+            }
+        }break;
+
+        case CENTER_HOLD_WAIT_VISION:
+        {
+            if((!s_stepper_enabled) || (!s_vision_control_active) ||
+               (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+            {
+                center_hold_state_reset();
+                wireless_debug_printf(
+                    "S2 PREP ABORTED: vision/motor stopped\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if((!s_vision_ball_lost) &&
+               (s_camera_link_age <= VISION_LINK_TIMEOUT_LOOPS) &&
+               s_camera_measurement_valid)
+            {
+                if(s_center_hold_stable_frames <
+                   COMPETITION_PREP_STABLE_FRAMES)
+                {
+                    s_center_hold_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_center_hold_stable_frames = 0U;
+            }
+
+            if(s_center_hold_stable_frames >=
+               COMPETITION_PREP_STABLE_FRAMES)
+            {
+                auto_run_cancel();
+                s_app_control_mode = APP_CONTROL_KEY2_CENTER;
+                s_cascade_profile = CASCADE_PROFILE_KEY2_CENTER;
+                s_ball_target_position_x100 = 0;
+                cascade_pid_reset();
+                s_vision_sequence_seen = 1U;
+                s_vision_last_sequence = s_camera_sequence;
+                s_center_hold_phase = CENTER_HOLD_ACTIVE;
+                wireless_debug_printf(
+                    "S2 CENTER HOLD: target=0.00cm; hold S1/S2 to stop\r\n");
+            }
+        }break;
+
+        case CENTER_HOLD_ACTIVE:
+        {
+            if((!s_stepper_enabled) || (!s_vision_control_active))
+            {
+                center_hold_state_reset();
+                wireless_debug_printf("S2 CENTER HOLD ABORTED\r\n");
+            }
+            else if((APP_CONTROL_KEY2_CENTER != s_app_control_mode) ||
+                    (CASCADE_PROFILE_KEY2_CENTER != s_cascade_profile) ||
+                    (0 != s_ball_target_position_x100) ||
+                    (AUTO_RUN_IDLE != s_auto_run_phase))
+            {
+                // S2 owns the zero target until an explicit S/long press.
+                auto_run_cancel();
+                s_app_control_mode = APP_CONTROL_KEY2_CENTER;
+                s_cascade_profile = CASCADE_PROFILE_KEY2_CENTER;
+                s_ball_target_position_x100 = 0;
+                cascade_pid_reset();
+                s_vision_sequence_seen = 1U;
+                s_vision_last_sequence = s_camera_sequence;
+            }
+        }break;
+
+        case CENTER_HOLD_IDLE:
         default:
         {
         }break;
@@ -4129,11 +4904,13 @@ int main (void)
     wireless_debug_printf("Encoder PWM=B10, STEP=B12, DIR=B13, EN=B8(high=enable)\r\n");
     wireless_debug_printf("Vision UART2: B15=TX, B16=RX, 115200\r\n");
     wireless_debug_printf("Cascade PID: position -> target speed -> beam angle\r\n");
-    wireless_debug_printf("Generic Pos Kp=3.50 Ki=0.08; X+ Kd=0.30, X- Kd=0.40\r\n");
+    wireless_debug_printf("Generic 8926ff0: Pos Kp=3.50 Ki=0.08 Kd=1.00, brake=15\r\n");
     wireless_debug_printf("S1 fixed profile: X- Kd=0.55, brake=15, internal target=-5.20cm\r\n");
+    wireless_debug_printf("Modes: KEY1=fixed task; KEY2=center hold; serial X/V/A=generic 8926ff0\r\n");
+    wireless_debug_printf("S2 profile: Pos Kp=3.50 Ki=0.08 Kd=0.30/1.00, target=0.00cm\r\n");
     wireless_debug_printf("Position speed limit=20cm/s\r\n");
     wireless_debug_printf("Speed Kp=0.80 Ki=0.10 Kd=0.03, angle limit=+/-8deg\r\n");
-    wireless_debug_printf("Fast response: vref accel=200cm/s2, angle slew=1.2/2.0deg/frame\r\n");
+    wireless_debug_printf("Vision PID input: 50Hz; angle slew=1.20/2.00deg/frame\r\n");
     wireless_tx_flush_blocking();
     wireless_debug_printf("Landing capture: <=0.95cm; low speed or retreat at <=2.00cm/s\r\n");
     wireless_debug_printf("Landing catch: X+=4.60deg, X-=6.50deg; max500ms to +/-0.40cm\r\n");
@@ -4152,8 +4929,8 @@ int main (void)
     wireless_debug_printf("Encoder filter: jump reject + 3-frame <=25deg resync; abs limit 5 samples\r\n");
     wireless_debug_printf("Wireless TX: queued, runtime chunks <=2 bytes while motor enabled\r\n");
     wireless_debug_printf("Pulse test: visual stop, rel stop +4.4/-4.2deg, max500ms\r\n");
-    wireless_debug_printf("Boot: motor/vision OFF. Competition: level + ball at O, short S1 once.\r\n");
-    wireless_debug_printf("S1 waits for level/vision, then starts O->+5->-5; hold 1s=STOP.\r\n");
+    wireless_debug_printf("Boot: motor/vision OFF. Level beam; S1 also requires ball at O.\r\n");
+    wireless_debug_printf("S1=fixed task; S2=return/hold O; hold either key 1s=STOP.\r\n");
     wireless_debug_printf("Limits: target +/-20deg, test trip +/-25deg, absolute 121~208deg\r\n");
     wireless_print_help();
     wireless_tx_flush_blocking();
@@ -4213,6 +4990,7 @@ int main (void)
             key_scanner();
         }
         competition_button_update();
+        center_hold_button_update();
         vision_control_update();
         manual_pulse_update();
 
