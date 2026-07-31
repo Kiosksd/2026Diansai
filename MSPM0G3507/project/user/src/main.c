@@ -110,7 +110,7 @@
 #define CAMERA_RX_RING_SIZE                  (128U)
 #define CAMERA_RX_RING_MASK                  (CAMERA_RX_RING_SIZE - 1U)
 #define CAMERA_LINK_TIMEOUT_LOOPS            (300U)
-#define CAMERA_NOMINAL_FRAME_PERIOD_MS       (20U)   // 50Hz vision input; actual packet timestamp supplies PID dt
+#define CAMERA_NOMINAL_FRAME_PERIOD_MS       (20U)
 
 // 串级双环 PID：位置外环输出目标球速，速度内环输出摆杆目标角。
 // 所有量均使用 x100 定点数：位置 cm、速度 cm/s、角度 deg。
@@ -121,8 +121,8 @@
 #define GENERIC_POSITION_PID_KD_LEFT_X100    (200)
 #define GENERIC_POSITION_PID_I_LIMIT_X100    (200)   // target-speed integral term +/-2.00cm/s
 #define GENERIC_POSITION_PID_SPEED_LIMIT_X100 (2000) // target-ball-speed limit +/-20.00cm/s
-#define GENERIC_POSITION_BRAKE_RIGHT_X100    (1500)  // 8926ff0 braking planner: 15.00cm/s^2
-#define GENERIC_POSITION_BRAKE_LEFT_X100     (1500)
+#define GENERIC_POSITION_BRAKE_RIGHT_X100    (1600)  // 8926ff0 braking planner: 15.00cm/s^2
+#define GENERIC_POSITION_BRAKE_LEFT_X100     (1600)
 
 // KEY1 competition parameters are deliberately duplicated instead of aliased
 // to the generic profile.  Future tuning of another task must not change S1.
@@ -144,16 +144,16 @@
 
 // S2/KEY2 (A31) center-hold profile.  Keep it independent so later center
 // tuning cannot change the fixed S1 competition trajectory.
-#define S2_POSITION_PID_KP_X100              (350)
+#define S2_POSITION_PID_KP_X100              (360)
 #define S2_POSITION_PID_KI_X100              (8)
-#define S2_POSITION_PID_KD_RIGHT_X100        (30)
+#define S2_POSITION_PID_KD_RIGHT_X100        (70)
 #define S2_POSITION_PID_KD_LEFT_X100         (100)
 #define S2_POSITION_PID_I_LIMIT_X100         (200)
 #define S2_POSITION_PID_SPEED_LIMIT_X100     (2000)
 #define S2_POSITION_BRAKE_RIGHT_X100         (900)
 #define S2_POSITION_BRAKE_LEFT_X100          (1500)
 
-#define POSITION_SPEED_ACCEL_X100_PER_S      (20000) // 目标球速加速斜率 200.00cm/s^2
+#define POSITION_SPEED_ACCEL_X100_PER_S      (25000) // 目标球速加速斜率 200.00cm/s^2
 #define POSITION_SETTLE_BAND_X100            (8)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
 #define POSITION_LANDING_ARM_DISTANCE_X100   (200)   // use landing capture only after travel of at least 2.00cm
@@ -181,7 +181,7 @@
 #define POSITION_HOLD_RIGHT_TRIM_MAX_X100    (540)   // bounded adaptive trim ceiling
 #define POSITION_HOLD_RIGHT_TRIM_DISTANCE_X100 (5)   // withdraw each trim after 0.05cm rightward motion
 #define POSITION_HOLD_RIGHT_TRIM_SPEED_X100  (30)    // or after rightward speed reaches 0.30cm/s
-#define POSITION_HOLD_RIGHT_TRIM_FRAMES      (12U)   // hard limit about 240ms per trim at 50Hz
+#define POSITION_HOLD_RIGHT_TRIM_FRAMES      (12U)   // hard limit about 240ms per trim
 #define POSITION_HOLD_RIGHT_TRIM_COOLDOWN_FRAMES (5U) // allow braking/vision to settle for about 100ms
 #define POSITION_HOLD_RIGHT_TRIM_MAX_ATTEMPTS (16U)  // enough 0.05cm steps for a measured 0.45cm recovery
 #define POSITION_HOLD_RIGHT_SUPPORT_I_X100   (250)   // seed the proven near-3.5deg support after a trim moves
@@ -222,15 +222,15 @@
 #define AUTO_FINAL_RECOVERY_MAX_X100         (800)
 #define AUTO_FINAL_RECOVERY_RELEASE_X100     (5)     // withdraw after 0.05cm leftward displacement
 #define AUTO_FINAL_RECOVERY_SPEED_X100       (30)
-#define AUTO_FINAL_RECOVERY_ACTIVE_FRAMES    (12U)   // each launch is limited to about 240ms at 50Hz
-#define AUTO_FINAL_RECOVERY_COOLDOWN_FRAMES  (4U)    // about 80ms at 50Hz
+#define AUTO_FINAL_RECOVERY_ACTIVE_FRAMES    (12U)   // each launch is limited to about 240ms
+#define AUTO_FINAL_RECOVERY_COOLDOWN_FRAMES  (4U)
 #define AUTO_RUN_START_POSITION_X100         (50)    // require start within +/-0.50cm of O
 #define AUTO_RUN_START_SPEED_X100            (50)    // require start below 0.50cm/s
 #define AUTO_RUN_ENDPOINT_ERROR_X100         (100)   // both endpoints must be within +/-1.00cm
 #define AUTO_RUN_FINAL_SPEED_X100            (50)    // generic A point target: below 0.50cm/s
-#define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // generic A point target: about 100ms at 50Hz
+#define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // generic A point target: about 100ms
 #define S1_AUTO_RUN_FINAL_SPEED_X100         (30)    // S1 range must be quiet below 0.30cm/s
-#define S1_AUTO_RUN_FINAL_STABLE_FRAMES      (8U)    // verify the S1 range for about 160ms at 50Hz
+#define S1_AUTO_RUN_FINAL_STABLE_FRAMES      (8U)    // verify the S1 range for about 160ms
 #define AUTO_RUN_TIME_LIMIT_MS               (5000U)
 
 // S1/KEY1 (A30) runs the fixed competition task. S2/KEY2 (A31) uses the same
@@ -238,7 +238,7 @@
 // either key for one second is an emergency stop.
 #define COMPETITION_KEY_SCAN_PERIOD_MS        (10U)
 #define COMPETITION_LEVEL_BAND_X100           (15)    // beam settled within +/-0.15deg
-#define COMPETITION_PREP_STABLE_FRAMES        (5U)    // about 100ms at the 50Hz camera frame rate
+#define COMPETITION_PREP_STABLE_FRAMES        (5U)    // about 100ms at the camera frame rate
 #define COMPETITION_HANDS_OFF_DELAY_MS        (400U)   // short release/move-away margin after S1
 
 #define GENERIC_SPEED_PID_KP_X100            (110)    // 8926ff0 speed-loop profile
@@ -269,8 +269,8 @@
 #define PID_INTEGRAL_SCALE                   (100000)
 
 // 加速时平缓改变摆角；需要制动时允许更快地反向倾斜。
-#define VISION_ACCEL_ANGLE_SLEW_X100         (120)   // 1.20deg/frame gives the proven 60deg/s at 50Hz
-#define VISION_BRAKE_ANGLE_SLEW_X100         (200)   // 2.00deg/frame gives about 100deg/s at 50Hz
+#define VISION_ACCEL_ANGLE_SLEW_X100         (120)   // 1.20deg per camera frame
+#define VISION_BRAKE_ANGLE_SLEW_X100         (200)   // 2.00deg per camera frame
 #define VISION_POSITION_LIMIT_X100           (1200)  // calibrated useful range +/-12.00cm
 #define VISION_VELOCITY_LIMIT_X100           (5000)  // reject implausible values above 50.00cm/s
 #define VISION_TARGET_POSITION_LIMIT_X100    (1000)  // target range +/-10.00cm
@@ -4910,7 +4910,7 @@ int main (void)
     wireless_debug_printf("S2 profile: Pos Kp=3.50 Ki=0.08 Kd=0.30/1.00, target=0.00cm\r\n");
     wireless_debug_printf("Position speed limit=20cm/s\r\n");
     wireless_debug_printf("Speed Kp=0.80 Ki=0.10 Kd=0.03, angle limit=+/-8deg\r\n");
-    wireless_debug_printf("Vision PID input: 50Hz; angle slew=1.20/2.00deg/frame\r\n");
+    wireless_debug_printf("Fast response: vref accel=200cm/s2, angle slew=1.2/2.0deg/frame\r\n");
     wireless_tx_flush_blocking();
     wireless_debug_printf("Landing capture: <=0.95cm; low speed or retreat at <=2.00cm/s\r\n");
     wireless_debug_printf("Landing catch: X+=4.60deg, X-=6.50deg; max500ms to +/-0.40cm\r\n");

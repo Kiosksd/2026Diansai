@@ -51,7 +51,6 @@ DISPLAY_TARGET_CM = 0.0
 # debug UART on the MSPM0G3507 remains on B6/B7 and is not affected.
 VISION_UART_DEVICE = "/dev/ttyS3"
 VISION_UART_BAUDRATE = 115200
-VISION_UART_TX_PERIOD_MS = 20
 
 VISION_FRAME_HEAD_0 = 0xAA
 VISION_FRAME_HEAD_1 = 0x55
@@ -261,6 +260,7 @@ print("MaixCAM2 steel-ball perception sender")
 print("network streaming: OFF")
 print("vision link: Maix UART3 B2=TX/B3=RX -> 3507 UART2, 115200 8N1")
 print("vision link mode: position/speed input for MSPM0G3507 cascade PID")
+print("vision control rate: one UART packet per inference frame, about 60Hz")
 print("model input: {}x{}".format(input_width, input_height))
 print("axis: {} -> {}".format(AXIS_START_PX, AXIS_END_PX))
 print(
@@ -277,7 +277,6 @@ status_start_ms = last_loop_ms
 status_frame_count = 0
 display_fps = 0.0
 vision_sequence = 0
-last_vision_tx_ms = last_loop_ms
 
 while not app.need_exit():
     frame_start_ms = time.ticks_ms()
@@ -392,22 +391,19 @@ while not app.need_exit():
             thickness=2,
         )
 
-    # 20ms nominal period.  Advancing by the nominal period instead of by
-    # `now_ms` gives an average 50Hz stream even with a roughly 60FPS loop.
-    if now_ms - last_vision_tx_ms >= VISION_UART_TX_PERIOD_MS:
-        if now_ms - last_vision_tx_ms > 200:
-            last_vision_tx_ms = now_ms
-        else:
-            last_vision_tx_ms += VISION_UART_TX_PERIOD_MS
-        frame = make_vision_frame(
-            measurement_valid,
-            vision_sequence,
-            position_cm,
-            velocity_cm_s,
-            now_ms,
-        )
-        vision_uart.write(frame)
-        vision_sequence = (vision_sequence + 1) & 0xFF
+    # Send one measurement for every completed inference frame.  The camera
+    # loop runs at about 60FPS, so both cascade PID loops on the 3507 update at
+    # the same approximately 60Hz rate.  The packet timestamp remains the
+    # source of truth for PID dt when an occasional frame takes longer.
+    frame = make_vision_frame(
+        measurement_valid,
+        vision_sequence,
+        position_cm,
+        velocity_cm_s,
+        now_ms,
+    )
+    vision_uart.write(frame)
+    vision_sequence = (vision_sequence + 1) & 0xFF
 
     fps_text = "FPS:{:.1f}".format(display_fps)
     fps_size = image.string_size(fps_text, scale=1.2, thickness=2)
