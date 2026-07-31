@@ -1272,9 +1272,10 @@ int main (void)
 #endif
 
 #define SAFE_TRACK_BASE_TARGET           ( 23 )
+#define SAFE_TRACK_SLOW_BASE_TARGET      ( 15 )
 #define SAFE_TRACK_PID_KP                ( 3 )
 #define SAFE_TRACK_PID_KI                ( 0 )
-#define SAFE_TRACK_PID_KD                ( 1 )
+#define SAFE_TRACK_PID_KD                ( 2 )
 #define SAFE_TRACK_PID_I_DIV             ( 100 )
 #define SAFE_TRACK_PID_I_LIMIT           ( 500 )
 #define SAFE_TRACK_STEER_LIMIT            ( 10 )
@@ -1290,6 +1291,12 @@ int main (void)
 #define SAFE_TRACK_LAP_MINIMUM_MS        ( 12000 )
 #define SAFE_TRACK_FINISH_BLACK_MIN      ( 4 )
 #define SAFE_TRACK_FINISH_CONFIRM_TICKS  ( 1 )
+
+typedef enum
+{
+    SAFE_TRACK_MODE_NORMAL = 0,
+    SAFE_TRACK_MODE_SLOW,
+} safe_track_mode_enum;
 
 static volatile int16 safe_track_left_count = 0;
 static volatile int16 safe_track_right_count = 0;
@@ -1311,6 +1318,7 @@ static uint16 safe_track_finish_ticks = 0;
 static uint8 safe_track_black_count = 0;
 static uint8 safe_track_black_peak = 0;
 static bool safe_track_line_detected = false;
+static safe_track_mode_enum safe_track_mode = SAFE_TRACK_MODE_NORMAL;
 static uint8 safe_track_bin[SAFE_TRACK_SENSOR_CHANNELS] =
     {1, 1, 1, 1, 1, 1, 1, 1};
 
@@ -1325,6 +1333,7 @@ static uint32 safe_track_sensor_parse_error_count = 0;
 // Runtime parameters can be changed from VOFA+ without rebuilding. The macros
 // above remain the power-on defaults; parameter changes are not saved to flash.
 static volatile int16 safe_track_param_base = SAFE_TRACK_BASE_TARGET;
+static volatile int16 safe_track_active_base = SAFE_TRACK_BASE_TARGET;
 static volatile int16 safe_track_param_kp = SAFE_TRACK_PID_KP;
 static volatile int16 safe_track_param_ki = SAFE_TRACK_PID_KI;
 static volatile int16 safe_track_param_kd = SAFE_TRACK_PID_KD;
@@ -1417,6 +1426,10 @@ static bool safe_track_vofa_parameter_set (const char *name, uint32 value)
     if((0 == strcmp(name, "BASE")) && (value <= SAFE_TRACK_TARGET_MAX))
     {
         safe_track_param_base = (int16)value;
+        if((!safe_track_running) || (SAFE_TRACK_MODE_NORMAL == safe_track_mode))
+        {
+            safe_track_active_base = (int16)value;
+        }
     }
     else if((0 == strcmp(name, "KP")) && (value <= 20))
     {
@@ -1544,7 +1557,9 @@ static void safe_track_display_update (void)
     ips200_show_string(
         72,
         48,
-        safe_track_running ? "RUNNING " : "STOPPED ");
+        safe_track_running
+            ? ((SAFE_TRACK_MODE_SLOW == safe_track_mode) ? "SLOW    " : "NORMAL  ")
+            : "STOPPED ");
 
     sprintf(
         time_text,
@@ -1567,7 +1582,7 @@ static void safe_track_display_init (void)
     ips200_show_string(16, 16, "LINE FOLLOW CAR");
     ips200_show_string(16, 48, "STATE:");
     ips200_show_string(16, 80, "TIME:");
-    ips200_show_string(16, 112, "KEY1: START/STOP");
+    ips200_show_string(16, 112, "S1:NORMAL S2:SLOW");
     safe_track_display_update();
 }
 
@@ -1812,7 +1827,7 @@ static void safe_track_targets_update (void)
             -SAFE_TRACK_STEER_LIMIT,
             SAFE_TRACK_STEER_LIMIT);
         safe_track_last_error = safe_track_error;
-        base_target = safe_track_param_base;
+        base_target = safe_track_active_base;
     }
     else
     {
@@ -1822,7 +1837,7 @@ static void safe_track_targets_update (void)
         }
         safe_track_error_integral = 0;
         safe_track_correction = 0;
-        base_target = safe_track_param_base;
+        base_target = safe_track_active_base;
     }
 
     desired_left_target = (int16)safe_track_limit(
@@ -1842,7 +1857,7 @@ static void safe_track_targets_update (void)
         desired_right_target);
 }
 
-static bool safe_track_start (void)
+static bool safe_track_start (safe_track_mode_enum mode)
 {
     safe_test_motors_stop();
     safe_track_sensor_update();
@@ -1868,6 +1883,10 @@ static bool safe_track_start (void)
     safe_track_left_pwm = 0;
     safe_track_right_pwm = 0;
     safe_track_integrals_reset();
+    safe_track_mode = mode;
+    safe_track_active_base = (SAFE_TRACK_MODE_SLOW == mode)
+        ? SAFE_TRACK_SLOW_BASE_TARGET
+        : safe_track_param_base;
     safe_track_last_error = safe_track_error;
     safe_track_correction = (int16)safe_track_limit(
         safe_track_param_kp * safe_track_error,
@@ -1970,7 +1989,8 @@ int main (void)
     uint16 print_elapsed_ms = 0;
     uint16 display_elapsed_ms = 0;
     uint8 command;
-    key_state_enum key_state;
+    key_state_enum key1_state;
+    key_state_enum key2_state;
 #if SAFE_TRACK_USE_IR8_UART
     uint16 sensor_silence_ms = 0;
     bool sensor_new_frame;
@@ -2032,15 +2052,18 @@ int main (void)
 #if SAFE_TRACK_USE_IR8_UART
     wireless_uart_send_string("\r\nIR8 UART HALF-SPEED LINE TRACK READY\r\n");
     wireless_uart_send_string("SENSOR: X1=PHYSICAL LEFT, X8=RIGHT, BLACK=0, WHITE=1\r\n");
-    wireless_uart_send_string("KEY1=START/STOP, S/1=START, P/0=STOP, G=IR8 SNAPSHOT, ?=STATUS\r\n");
+    wireless_uart_send_string("S1(A30)=NORMAL, S2(A31)=SLOW; EITHER KEY STOPS WHILE RUNNING\r\n");
+    wireless_uart_send_string("S/1=NORMAL, L/2=SLOW, P/0=STOP, G=IR8 SNAPSHOT, ?=STATUS\r\n");
 #else
     wireless_uart_send_string("\r\nNEW LARGE-CAR LOW-SPEED LINE TRACK READY\r\n");
-    wireless_uart_send_string("KEY1=START/STOP, S/1=START, P/0=STOP, G=GRAY SNAPSHOT, ?=STATUS\r\n");
+    wireless_uart_send_string("S1(A30)=NORMAL, S2(A31)=SLOW; EITHER KEY STOPS WHILE RUNNING\r\n");
+    wireless_uart_send_string("S/1=NORMAL, L/2=SLOW, P/0=STOP, G=GRAY SNAPSHOT, ?=STATUS\r\n");
 #endif
     sprintf(
         send_buffer,
-        "TRACK: BASE=%d count/10ms, PID KP=%d KI=%d KD=%d\r\n",
+        "TRACK: NORMAL=%d SLOW=%d count/10ms, PID KP=%d KI=%d KD=%d\r\n",
         safe_track_param_base,
+        SAFE_TRACK_SLOW_BASE_TARGET,
         safe_track_param_kp,
         safe_track_param_ki,
         safe_track_param_kd);
@@ -2067,25 +2090,38 @@ int main (void)
     wireless_uart_send_string(
         "VOFA+ FIREWATER: car=12 channels, params=4 channels, 115200 baud\r\n");
     wireless_uart_send_string(
-        "VOFA TUNE: @BASE=20# @KP=2# @KI=0# @KD=1# @GET#\r\n");
+        "VOFA TUNE NORMAL: @BASE=23# @KP=3# @KI=0# @KD=1# @GET#\r\n");
     safe_track_vofa_parameters_send();
 
     while(true)
     {
         key_scanner();
-        key_state = key_get_state(KEY_1);
-        if(KEY_SHORT_PRESS == key_state)
+        key1_state = key_get_state(KEY_1);
+        key2_state = key_get_state(KEY_2);
+        if((KEY_SHORT_PRESS == key1_state) || (KEY_SHORT_PRESS == key2_state))
         {
-            key_clear_state(KEY_1);
+            if(KEY_SHORT_PRESS == key1_state)
+            {
+                key_clear_state(KEY_1);
+            }
+            if(KEY_SHORT_PRESS == key2_state)
+            {
+                key_clear_state(KEY_2);
+            }
             display_elapsed_ms = 0;
 
             if(safe_track_running)
             {
-                safe_track_stop("KEY1 PRESSED");
+                safe_track_stop(
+                    (KEY_SHORT_PRESS == key1_state) ? "S1/A30 PRESSED" : "S2/A31 PRESSED");
+            }
+            else if(KEY_SHORT_PRESS == key1_state)
+            {
+                safe_track_start(SAFE_TRACK_MODE_NORMAL);
             }
             else
             {
-                safe_track_start();
+                safe_track_start(SAFE_TRACK_MODE_SLOW);
             }
         }
 
@@ -2131,7 +2167,7 @@ int main (void)
                     {
                         wireless_uart_send_string("ALREADY RUNNING: SEND 0 TO STOP\r\n");
                     }
-                    else if(safe_track_start())
+                    else if(safe_track_start(SAFE_TRACK_MODE_NORMAL))
                     {
                         sprintf(
                             send_buffer,
@@ -2144,6 +2180,27 @@ int main (void)
                             safe_track_bin[5],
                             safe_track_bin[6],
                             safe_track_bin[7],
+                            safe_track_error,
+                            safe_track_left_target,
+                            safe_track_right_target);
+                        wireless_uart_send_string(send_buffer);
+                    }
+                }break;
+
+                case 'L':
+                case 'l':
+                case '2':
+                {
+                    if(safe_track_running)
+                    {
+                        wireless_uart_send_string("ALREADY RUNNING: SEND 0 TO STOP\r\n");
+                    }
+                    else if(safe_track_start(SAFE_TRACK_MODE_SLOW))
+                    {
+                        sprintf(
+                            send_buffer,
+                            "START SLOW base=%d err=%d Ltarget=%d Rtarget=%d\r\n",
+                            safe_track_active_base,
                             safe_track_error,
                             safe_track_left_target,
                             safe_track_right_target);
@@ -2175,9 +2232,11 @@ int main (void)
                 {
                     sprintf(
                         send_buffer,
-                        "STATUS run=%u t=%lums det=%u err=%d lost=%u "
+                        "STATUS run=%u mode=%s base=%d t=%lums det=%u err=%d lost=%u "
                         "L[t=%d c=%d p=%ld] R[t=%d c=%d p=%ld]\r\n",
                         safe_track_running,
+                        (SAFE_TRACK_MODE_SLOW == safe_track_mode) ? "SLOW" : "NORMAL",
+                        safe_track_active_base,
                         (unsigned long)safe_track_elapsed_ms,
                         safe_track_line_detected,
                         safe_track_error,
@@ -2196,10 +2255,10 @@ int main (void)
                 {
 #if SAFE_TRACK_USE_IR8_UART
                     wireless_uart_send_string(
-                        "S/1=START,P/0=STOP,G=IR8,?=STATUS,@GET# or @NAME=VALUE#; LOST KEEPS STRAIGHT\r\n");
+                        "S/1=NORMAL,L/2=SLOW,P/0=STOP,G=IR8,?=STATUS,@GET#; LOST KEEPS STRAIGHT\r\n");
 #else
                     wireless_uart_send_string(
-                        "S/1=START,P/0=STOP,G=GRAY,?=STATUS,@GET# or @NAME=VALUE#; LOST KEEPS STRAIGHT\r\n");
+                        "S/1=NORMAL,L/2=SLOW,P/0=STOP,G=GRAY,?=STATUS,@GET#; LOST KEEPS STRAIGHT\r\n");
 #endif
                 }break;
 
@@ -2258,7 +2317,7 @@ int main (void)
                     safe_track_black_count,
                     safe_track_black_peak,
                     (unsigned long)recommended_scale_x1000,
-                    (unsigned long)((safe_track_param_base
+                    (unsigned long)((safe_track_active_base
                         * recommended_scale_x1000 + 500UL) / 1000UL));
                 wireless_uart_send_string(send_buffer);
             }
