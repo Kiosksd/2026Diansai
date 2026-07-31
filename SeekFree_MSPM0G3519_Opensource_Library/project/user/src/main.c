@@ -1273,9 +1273,9 @@ int main (void)
 
 #define SAFE_TRACK_BASE_TARGET           ( 23 )
 #define SAFE_TRACK_SLOW_BASE_TARGET      ( 15 )
-#define SAFE_TRACK_PID_KP                ( 3 )
+#define SAFE_TRACK_PID_KP                ( 2 )
 #define SAFE_TRACK_PID_KI                ( 0 )
-#define SAFE_TRACK_PID_KD                ( 2 )
+#define SAFE_TRACK_PID_KD                ( 1 )
 #define SAFE_TRACK_PID_I_DIV             ( 100 )
 #define SAFE_TRACK_PID_I_LIMIT           ( 500 )
 #define SAFE_TRACK_STEER_LIMIT            ( 10 )
@@ -1285,8 +1285,9 @@ int main (void)
 #define SAFE_TRACK_SPEED_KI              ( 1 )
 #define SAFE_TRACK_INTEGRAL_LIMIT        ( 500 )
 #define SAFE_TRACK_PWM_LIMIT             ( 4500 )
-#define SAFE_TRACK_TARGET_RISE_STEP      ( 1 )
-#define SAFE_TRACK_TARGET_FALL_STEP      ( 2 )
+#define SAFE_TRACK_BASE_RAMP_SCALE       ( 100 )
+#define SAFE_TRACK_BASE_RISE_X100        ( 25 )
+#define SAFE_TRACK_BASE_FALL_X100        ( 50 )
 #define SAFE_TRACK_LAP_TARGET_MS         ( 20000 )
 #define SAFE_TRACK_LAP_MINIMUM_MS        ( 12000 )
 #define SAFE_TRACK_FINISH_BLACK_MIN      ( 4 )
@@ -1312,6 +1313,8 @@ static volatile uint32 safe_track_elapsed_ms = 0;
 static int16 safe_track_error = 0;
 static int16 safe_track_last_error = 0;
 static int16 safe_track_correction = 0;
+static int16 safe_track_ramped_base = 0;
+static int32 safe_track_ramped_base_x100 = 0;
 static int32 safe_track_error_integral = 0;
 static uint16 safe_track_lost_ticks = 0;
 static uint16 safe_track_finish_ticks = 0;
@@ -1599,25 +1602,31 @@ static int32 safe_track_limit (int32 value, int32 minimum, int32 maximum)
     return value;
 }
 
-static int16 safe_track_target_slew (int16 current, int16 desired)
+static int16 safe_track_base_ramp_update (int16 desired)
 {
-    if(desired > current)
+    int32 desired_x100 = (int32)desired * SAFE_TRACK_BASE_RAMP_SCALE;
+
+    if(desired_x100 > safe_track_ramped_base_x100)
     {
-        current += SAFE_TRACK_TARGET_RISE_STEP;
-        if(current > desired)
+        safe_track_ramped_base_x100 += SAFE_TRACK_BASE_RISE_X100;
+        if(safe_track_ramped_base_x100 > desired_x100)
         {
-            current = desired;
+            safe_track_ramped_base_x100 = desired_x100;
         }
     }
-    else if(desired < current)
+    else if(desired_x100 < safe_track_ramped_base_x100)
     {
-        current -= SAFE_TRACK_TARGET_FALL_STEP;
-        if(current < desired)
+        safe_track_ramped_base_x100 -= SAFE_TRACK_BASE_FALL_X100;
+        if(safe_track_ramped_base_x100 < desired_x100)
         {
-            current = desired;
+            safe_track_ramped_base_x100 = desired_x100;
         }
     }
-    return current;
+
+    // The encoder target is an integer count per 10 ms. A fixed-point ramp
+    // still makes those integer steps arrive evenly instead of every loop.
+    return (int16)((safe_track_ramped_base_x100
+        + SAFE_TRACK_BASE_RAMP_SCALE / 2) / SAFE_TRACK_BASE_RAMP_SCALE);
 }
 
 static bool safe_track_sensor_update (void)
@@ -1672,34 +1681,63 @@ static uint8 safe_track_black_count_get (void)
 
 static bool safe_track_line_error_calculate (int16 *error)
 {
-    int16 left = -1;
-    int16 right = -1;
+    uint8 run_start = 0;
+    uint8 run_length = 0;
+    uint8 best_length = 0;
     uint8 index;
+    int16 run_error;
+    int16 best_error = 0;
+    int16 run_distance;
+    int16 best_distance;
 
-    for(index = 0; index < SAFE_TRACK_SENSOR_CHANNELS; index ++)
+    // Select the longest continuous black segment instead of blindly using
+    // the two outermost black sensors. This prevents one isolated noisy bit
+    // from pulling the calculated line position across the sensor array.
+    for(index = 0; index <= SAFE_TRACK_SENSOR_CHANNELS; index ++)
     {
-        if(0 == safe_track_bin[index])
+        if((index < SAFE_TRACK_SENSOR_CHANNELS)
+            && (0 == safe_track_bin[index]))
         {
-            left = index;
-            break;
+            if(0 == run_length)
+            {
+                run_start = index;
+            }
+            run_length ++;
+        }
+        else if(run_length > 0)
+        {
+            run_error = (int16)(2 * run_start + run_length - 1
+                - (SAFE_TRACK_SENSOR_CHANNELS - 1));
+            run_distance = run_error - safe_track_last_error;
+            if(run_distance < 0)
+            {
+                run_distance = -run_distance;
+            }
+            best_distance = best_error - safe_track_last_error;
+            if(best_distance < 0)
+            {
+                best_distance = -best_distance;
+            }
+
+            // If two segments have the same width, retain the one nearest to
+            // the previous line position so the error cannot jump randomly.
+            if((run_length > best_length)
+                || ((run_length == best_length)
+                    && (run_distance < best_distance)))
+            {
+                best_length = run_length;
+                best_error = run_error;
+            }
+            run_length = 0;
         }
     }
 
-    for(index = SAFE_TRACK_SENSOR_CHANNELS; index > 0; index --)
-    {
-        if(0 == safe_track_bin[index - 1])
-        {
-            right = index - 1;
-            break;
-        }
-    }
-
-    if((left < 0) || (right < 0))
+    if(0 == best_length)
     {
         return false;
     }
 
-    *error = left + right - (SAFE_TRACK_SENSOR_CHANNELS - 1);
+    *error = best_error;
     return true;
 }
 
@@ -1788,6 +1826,8 @@ static void safe_track_control_callback (uint32 event, void *ptr)
 static void safe_track_stop (const char *reason)
 {
     safe_track_running = false;
+    safe_track_ramped_base = 0;
+    safe_track_ramped_base_x100 = 0;
     safe_track_left_target = 0;
     safe_track_right_target = 0;
     safe_track_left_pwm = 0;
@@ -1806,10 +1846,18 @@ static void safe_track_targets_update (void)
 {
     int16 derivative;
     int16 base_target;
+    int16 steer_limit;
     int16 desired_left_target;
     int16 desired_right_target;
 
     safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
+    base_target = safe_track_active_base;
+    safe_track_ramped_base = safe_track_base_ramp_update(base_target);
+    steer_limit = safe_track_ramped_base / 2;
+    if(steer_limit > SAFE_TRACK_STEER_LIMIT)
+    {
+        steer_limit = SAFE_TRACK_STEER_LIMIT;
+    }
 
     if(safe_track_line_detected)
     {
@@ -1824,10 +1872,9 @@ static void safe_track_targets_update (void)
                 + (safe_track_param_ki * safe_track_error_integral)
                     / SAFE_TRACK_PID_I_DIV
                 + safe_track_param_kd * derivative,
-            -SAFE_TRACK_STEER_LIMIT,
-            SAFE_TRACK_STEER_LIMIT);
+            -steer_limit,
+            steer_limit);
         safe_track_last_error = safe_track_error;
-        base_target = safe_track_active_base;
     }
     else
     {
@@ -1837,24 +1884,21 @@ static void safe_track_targets_update (void)
         }
         safe_track_error_integral = 0;
         safe_track_correction = 0;
-        base_target = safe_track_active_base;
     }
 
     desired_left_target = (int16)safe_track_limit(
-        base_target + safe_track_correction,
+        safe_track_ramped_base + safe_track_correction,
         0,
         SAFE_TRACK_TARGET_MAX);
     desired_right_target = (int16)safe_track_limit(
-        base_target - safe_track_correction,
+        safe_track_ramped_base - safe_track_correction,
         0,
         SAFE_TRACK_TARGET_MAX);
 
-    safe_track_left_target = safe_track_target_slew(
-        safe_track_left_target,
-        desired_left_target);
-    safe_track_right_target = safe_track_target_slew(
-        safe_track_right_target,
-        desired_right_target);
+    // Ramp only the common base speed. Apply the PID differential immediately
+    // so a left/right correction reversal is not delayed by 100-200 ms.
+    safe_track_left_target = desired_left_target;
+    safe_track_right_target = desired_right_target;
 }
 
 static bool safe_track_start (safe_track_mode_enum mode)
@@ -1882,6 +1926,8 @@ static bool safe_track_start (safe_track_mode_enum mode)
     safe_track_right_count = 0;
     safe_track_left_pwm = 0;
     safe_track_right_pwm = 0;
+    safe_track_ramped_base = 0;
+    safe_track_ramped_base_x100 = 0;
     safe_track_integrals_reset();
     safe_track_mode = mode;
     safe_track_active_base = (SAFE_TRACK_MODE_SLOW == mode)
@@ -2070,7 +2116,17 @@ int main (void)
     wireless_uart_send_string(send_buffer);
     sprintf(
         send_buffer,
-        "STEER_LIMIT=%d, PWM_LIMIT=%d, NO FIXED TIME LIMIT\r\n",
+        "SOFT START: NORMAL~%lums SLOW~%lums; SPEED PI HOLDS TARGET\r\n",
+        (unsigned long)((safe_track_param_base * SAFE_TRACK_BASE_RAMP_SCALE
+            * SAFE_TRACK_CONTROL_PERIOD_MS + SAFE_TRACK_BASE_RISE_X100 - 1)
+            / SAFE_TRACK_BASE_RISE_X100),
+        (unsigned long)((SAFE_TRACK_SLOW_BASE_TARGET * SAFE_TRACK_BASE_RAMP_SCALE
+            * SAFE_TRACK_CONTROL_PERIOD_MS + SAFE_TRACK_BASE_RISE_X100 - 1)
+            / SAFE_TRACK_BASE_RISE_X100));
+    wireless_uart_send_string(send_buffer);
+    sprintf(
+        send_buffer,
+        "STEER_LIMIT_MAX=%d, PWM_LIMIT=%d, NO FIXED TIME LIMIT\r\n",
         SAFE_TRACK_STEER_LIMIT,
         SAFE_TRACK_PWM_LIMIT);
     wireless_uart_send_string(send_buffer);
@@ -2090,7 +2146,7 @@ int main (void)
     wireless_uart_send_string(
         "VOFA+ FIREWATER: car=12 channels, params=4 channels, 115200 baud\r\n");
     wireless_uart_send_string(
-        "VOFA TUNE NORMAL: @BASE=23# @KP=3# @KI=0# @KD=1# @GET#\r\n");
+        "VOFA TUNE: @BASE=n# @KP=n# @KI=n# @KD=n# @GET#\r\n");
     safe_track_vofa_parameters_send();
 
     while(true)
