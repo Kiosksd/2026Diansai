@@ -89,6 +89,8 @@
 #define WIRELESS_COMMAND_IDLE_LOOPS          (20U)
 #define WIRELESS_STATUS_PERIOD_LOOPS         (100U)
 #define WIRELESS_ACTIVE_STATUS_PERIOD_LOOPS  (500U)
+#define WIRELESS_DIAGNOSTIC_PERIOD_LOOPS     (40U)   // RAM sample at about 25Hz
+#define DIAGNOSTIC_LOG_CAPACITY              (896U)  // about 36 seconds at 25Hz; preserves MCU RAM margin
 
 // MaixCAM2 独立使用 UART2：主板串口插座 B15/T=TX、B16/R=RX，115200 8N1。
 #define CAMERA_UART_INDEX                    (UART_2)
@@ -110,13 +112,65 @@
 // 正球速表示向右；机构实测正摆角使球向左，因此速度环输出到摆角时需要反号。
 #define POSITION_PID_KP_X100                 (350)   // 3.50 (cm/s)/cm
 #define POSITION_PID_KI_X100                 (8)     // 0.08 (cm/s)/(cm*s)
-#define POSITION_PID_KD_X100                 (100)   // 1.00 (cm/s)/(cm/s), early braking
+#define POSITION_PID_KD_RIGHT_X100           (30)    // X+: 0.30, measured-distance braking is dominant
+#define POSITION_PID_KD_LEFT_X100            (100)   // X-: retain proven 1.00 damping
 #define POSITION_PID_I_LIMIT_X100            (200)   // 目标速度积分项 +/-2.00cm/s
 #define POSITION_PID_SPEED_LIMIT_X100        (2000)  // 最大目标球速 +/-20.00cm/s
 #define POSITION_SPEED_ACCEL_X100_PER_S      (20000) // 目标球速加速斜率 200.00cm/s^2
-#define POSITION_BRAKE_ACCEL_X100            (1500)  // 保守按 15.00cm/s^2 规划刹车
+#define POSITION_BRAKE_ACCEL_RIGHT_X100      (900)   // X+: measured effective braking about 9.00cm/s^2
+#define POSITION_BRAKE_ACCEL_LEFT_X100       (1500)  // X-: retain proven 15.00cm/s^2 planner
 #define POSITION_SETTLE_BAND_X100            (8)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
+#define POSITION_LANDING_ARM_DISTANCE_X100   (200)   // use landing capture only after travel of at least 2.00cm
+#define POSITION_LANDING_BAND_X100           (95)    // measured first-stop window: strictly inside +/-1.00cm
+#define POSITION_LANDING_SPEED_X100          (50)    // capture after braking below 0.50cm/s
+#define POSITION_LANDING_RETREAT_X100        (5)     // or capture after retreating 0.05cm from the best landing
+#define POSITION_LANDING_RETREAT_SPEED_X100  (200)   // retreat capture is forbidden above 2.00cm/s
+#define POSITION_LANDING_MAX_ERROR_X100      (99)    // never latch a new landing at or beyond 1.00cm error
+#define POSITION_LANDING_RELEASE_RIGHT_X100  (120)   // X+: retain proven 1.20cm HOLD release
+#define POSITION_LANDING_RELEASE_LEFT_X100   (160)   // X-: keep recovery active through measured rebound
+#define POSITION_HOLD_KP_X100                (200)   // HOLD requests 2.00cm/s per cm of residual error
+#define POSITION_HOLD_SPEED_LIMIT_X100       (150)   // quiet HOLD correction limited to +/-1.50cm/s
+#define POSITION_HOLD_ANGLE_LIMIT_X100       (400)   // HOLD never commands more than +/-4.00deg
+#define POSITION_HOLD_TRANSIENT_LIMIT_X100   (800)   // X- catch/trim stays inside the full PID +/-8deg limit
+#define POSITION_HOLD_CATCH_RIGHT_ANGLE_X100 (460)   // X+: measured breakaway angle, used only during catch
+#define POSITION_HOLD_CATCH_LEFT_ANGLE_X100  (650)   // X-: arrest the measured rebound immediately
+#define POSITION_HOLD_CATCH_RIGHT_FRAMES     (25U)   // X+: up to about 500ms on the 50Hz vision stream
+#define POSITION_HOLD_CATCH_LEFT_FRAMES      (25U)   // X-: up to about 500ms, same bounded landing window
+#define POSITION_HOLD_CATCH_RIGHT_CANCEL_X100 (40)   // X+: withdraw catch at target-0.40cm for overshoot margin
+#define POSITION_HOLD_CATCH_LEFT_CANCEL_X100 (40)    // X-: withdraw near target+0.40cm
+#define POSITION_HOLD_RIGHT_TRIM_START_X100  (45)    // X+: keep 0.05cm margin above target-0.50cm
+#define POSITION_HOLD_RIGHT_TRIM_STOP_X100   (40)    // X+: no trim once target-0.40cm is reached
+#define POSITION_HOLD_RIGHT_TRIM_BASE_X100   (460)   // first measured rightward breakaway attempt
+#define POSITION_HOLD_RIGHT_TRIM_STEP_X100   (20)    // add 0.20deg after each no-motion timeout
+#define POSITION_HOLD_RIGHT_TRIM_MAX_X100    (540)   // bounded adaptive trim ceiling
+#define POSITION_HOLD_RIGHT_TRIM_DISTANCE_X100 (5)   // withdraw each trim after 0.05cm rightward motion
+#define POSITION_HOLD_RIGHT_TRIM_SPEED_X100  (30)    // or after rightward speed reaches 0.30cm/s
+#define POSITION_HOLD_RIGHT_TRIM_FRAMES      (12U)   // hard limit about 240ms per trim
+#define POSITION_HOLD_RIGHT_TRIM_COOLDOWN_FRAMES (5U) // allow braking/vision to settle for about 100ms
+#define POSITION_HOLD_RIGHT_TRIM_MAX_ATTEMPTS (16U)  // enough 0.05cm steps for a measured 0.45cm recovery
+#define POSITION_HOLD_RIGHT_SUPPORT_I_X100   (250)   // seed the proven near-3.5deg support after a trim moves
+#define POSITION_HOLD_RIGHT_CEILING_ENTER_X100 (40)  // start reverse guard at target+0.40cm
+#define POSITION_HOLD_RIGHT_CEILING_EXIT_X100  (20)  // release guard after returning inside target+0.20cm
+#define POSITION_HOLD_RIGHT_CEILING_ANGLE_X100 (460) // transient reverse guard, still below full PID limit
+#define POSITION_HOLD_LEFT_TRIM_START_X100   (45)    // X-: keep 0.05cm margin above the 1cm acceptance edge
+#define POSITION_HOLD_LEFT_TRIM_STOP_X100    (40)    // X-: no trim once inside target+0.40cm
+#define POSITION_HOLD_LEFT_TRIM_BASE_X100    (650)   // continue from the stronger X- catch level
+#define POSITION_HOLD_LEFT_TRIM_STEP_X100    (25)    // add 0.25deg after each no-motion timeout
+#define POSITION_HOLD_LEFT_TRIM_MAX_X100     (800)   // full PID limit, with 0.05cm immediate release
+#define POSITION_HOLD_LEFT_SUPPORT_I_X100    (-250)  // symmetric speed-integral support after leftward motion
+#define POSITION_HOLD_LEFT_FLOOR_ENTER_X100  (40)    // start reverse guard at target-0.40cm
+#define POSITION_HOLD_LEFT_FLOOR_EXIT_X100   (20)    // release after returning inside target-0.20cm
+#define POSITION_HOLD_LEFT_FLOOR_ANGLE_X100  (-460)  // rightward recovery after a left-side overshoot
+
+#define AUTO_RUN_RIGHT_TARGET_X100           (500)   // O -> +5.00cm
+#define AUTO_RUN_LEFT_TARGET_X100            (-500)  // +5.00cm -> -5.00cm
+#define AUTO_RUN_START_POSITION_X100         (50)    // require start within +/-0.50cm of O
+#define AUTO_RUN_START_SPEED_X100            (50)    // require start below 0.50cm/s
+#define AUTO_RUN_ENDPOINT_ERROR_X100         (100)   // both endpoints must be within +/-1.00cm
+#define AUTO_RUN_FINAL_SPEED_X100            (50)    // final stable speed below 0.50cm/s
+#define AUTO_RUN_FINAL_STABLE_FRAMES         (5U)    // verify final hold for about 100ms
+#define AUTO_RUN_TIME_LIMIT_MS               (5000U)
 
 #define SPEED_PID_KP_X100                    (80)    // 0.80 deg/(cm/s), strong braking near target
 #define SPEED_PID_KI_X100                    (10)    // 0.10 deg/cm
@@ -192,6 +246,35 @@ typedef enum
     MANUAL_PULSE_PHASE_HOLD,
 } manual_pulse_phase_enum;
 
+typedef enum
+{
+    AUTO_RUN_IDLE = 0,
+    AUTO_RUN_TO_RIGHT,
+    AUTO_RUN_TO_LEFT,
+    AUTO_RUN_COMPLETE,
+} auto_run_phase_enum;
+
+typedef struct
+{
+    uint16 capture_ms;
+    int16 position_x100;
+    int16 velocity_x100;
+    int16 target_position_x100;
+    int16 position_error_x100;
+    int16 target_velocity_x100;
+    int16 angle_command_x100;
+    int16 relative_angle_x100;
+    int16 step_frequency_pps;
+    uint8 sequence;
+    uint8 measurement_valid;
+    uint8 stiction_active;
+    uint8 stiction_blocked;
+    uint8 landing_hold;
+    uint8 position_limited;
+    uint8 speed_limited;
+    uint8 fault;
+} diagnostic_sample_struct;
+
 volatile uint32 g_ms42_pwm_high_ticks = 0;
 volatile uint32 g_ms42_pwm_period_ticks = 0;
 volatile uint8  g_ms42_pwm_sample_ready = 0;
@@ -230,6 +313,12 @@ static uint32 s_direction_check_reference_error = 0;
 static char   s_wireless_command_buffer[WIRELESS_COMMAND_BUFFER_SIZE];
 static uint32 s_wireless_command_length = 0;
 static uint32 s_wireless_command_idle = 0;
+static uint8  s_diagnostic_log_enabled = 0;
+static uint8  s_diagnostic_sequence_seen = 0;
+static uint8  s_diagnostic_last_sequence = 0;
+static uint8  s_diagnostic_log_full = 0;
+static uint16 s_diagnostic_sample_count = 0;
+static diagnostic_sample_struct s_diagnostic_samples[DIAGNOSTIC_LOG_CAPACITY];
 
 static volatile uint8  s_camera_rx_ring[CAMERA_RX_RING_SIZE];
 static volatile uint8  s_camera_rx_head = 0;
@@ -266,6 +355,27 @@ static uint8  s_position_output_limited = 0;
 static int32  s_position_previous_error_x100 = 0;
 static uint8  s_position_error_seen = 0;
 static uint8  s_position_target_crossed = 0;
+static uint8  s_landing_capture_armed = 0;
+static uint8  s_landing_hold_active = 0;
+static int8   s_landing_move_direction = 0;
+static uint8  s_landing_catch_frames_remaining = 0;
+static uint32 s_landing_catch_angle_x100 = 0;
+static uint32 s_landing_catch_cancel_x100 = 0;
+static uint32 s_landing_best_error_x100 = 0;
+static uint8  s_landing_trim_active = 0;
+static uint8  s_landing_trim_frames = 0;
+static uint8  s_landing_trim_cooldown_frames = 0;
+static uint8  s_landing_trim_attempts = 0;
+static uint8  s_landing_trim_no_motion_retries = 0;
+static int32  s_landing_trim_angle_x100 = 0;
+static int32  s_landing_trim_start_position_x100 = 0;
+static uint8  s_landing_ceiling_guard_active = 0;
+static auto_run_phase_enum s_auto_run_phase = AUTO_RUN_IDLE;
+static uint16 s_auto_run_start_ms = 0U;
+static uint16 s_auto_run_right_ms = 0U;
+static int32  s_auto_run_right_position_x100 = 0;
+static uint8  s_auto_run_timeout_reported = 0U;
+static uint8  s_auto_run_final_stable_frames = 0U;
 
 static int32  s_speed_error_x100 = 0;
 static int32  s_speed_p_term_x100 = 0;
@@ -522,8 +632,39 @@ static void camera_uart_process_received_data (void)
     }
 }
 
+static uint16 auto_run_elapsed_ms (void)
+{
+    return (uint16)(s_camera_capture_ms_low16 - s_auto_run_start_ms);
+}
+
+static void auto_run_cancel (void)
+{
+    s_auto_run_phase = AUTO_RUN_IDLE;
+    s_auto_run_start_ms = 0U;
+    s_auto_run_right_ms = 0U;
+    s_auto_run_right_position_x100 = 0;
+    s_auto_run_timeout_reported = 0U;
+    s_auto_run_final_stable_frames = 0U;
+}
+
+static void landing_seed_support_integral (void)
+{
+    if(s_landing_move_direction > 0)
+    {
+        s_speed_i_term_x100 = POSITION_HOLD_RIGHT_SUPPORT_I_X100;
+    }
+    else
+    {
+        s_speed_i_term_x100 = POSITION_HOLD_LEFT_SUPPORT_I_X100;
+    }
+    s_speed_i_accumulator = s_speed_i_term_x100 * PID_INTEGRAL_SCALE;
+}
+
 static void cascade_pid_reset (void)
 {
+    int32 reset_position_error_x100 = s_ball_target_position_x100 -
+        s_camera_position_x100;
+
     s_position_error_x100 = 0;
     s_position_p_term_x100 = 0;
     s_position_i_accumulator = 0;
@@ -534,6 +675,25 @@ static void cascade_pid_reset (void)
     s_position_previous_error_x100 = 0;
     s_position_error_seen = 0U;
     s_position_target_crossed = 0U;
+    s_landing_capture_armed =
+        (int32_abs_to_uint32(reset_position_error_x100) >=
+            POSITION_LANDING_ARM_DISTANCE_X100) ? 1U : 0U;
+    s_landing_hold_active = 0U;
+    s_landing_move_direction = (reset_position_error_x100 > 0) ? 1 :
+        ((reset_position_error_x100 < 0) ? -1 : 0);
+    s_landing_catch_frames_remaining = 0U;
+    s_landing_catch_angle_x100 = 0U;
+    s_landing_catch_cancel_x100 = 0U;
+    s_landing_best_error_x100 =
+        int32_abs_to_uint32(reset_position_error_x100);
+    s_landing_trim_active = 0U;
+    s_landing_trim_frames = 0U;
+    s_landing_trim_cooldown_frames = 0U;
+    s_landing_trim_attempts = 0U;
+    s_landing_trim_no_motion_retries = 0U;
+    s_landing_trim_angle_x100 = 0;
+    s_landing_trim_start_position_x100 = 0;
+    s_landing_ceiling_guard_active = 0U;
 
     s_speed_error_x100 = 0;
     s_speed_p_term_x100 = 0;
@@ -720,8 +880,10 @@ static void cascade_pid_update (void)
     uint32 error_abs;
     uint32 velocity_abs;
     uint32 brake_speed_x100;
+    uint32 brake_accel_x100;
     int32 candidate_accumulator;
     int32 command_without_new_i;
+    int32 position_kd_x100;
     int32 desired_velocity_x100;
     int32 target_velocity_delta_x100;
     int32 max_velocity_increase_x100;
@@ -731,9 +893,18 @@ static void cascade_pid_update (void)
     int32 desired_angle_x100;
     int32 target_angle_delta_x100;
     int32 angle_slew_limit_x100;
+    int32 landing_trim_displacement_x100;
+    int32 hold_angle_limit_x100;
     uint8 position_integral_allowed;
     uint8 speed_integral_allowed;
     uint8 settled;
+    uint8 landing_just_captured = 0U;
+    uint8 landing_trim_stop_reached;
+    uint8 landing_trim_directional_motion;
+    uint8 landing_trim_start_valid;
+    int32 landing_trim_base_x100;
+    int32 landing_trim_step_x100;
+    int32 landing_trim_max_x100;
 
     if(!s_cascade_time_seen)
     {
@@ -760,6 +931,377 @@ static void cascade_pid_update (void)
         s_camera_position_x100;
     error_abs = int32_abs_to_uint32(s_position_error_x100);
     velocity_abs = int32_abs_to_uint32(s_camera_velocity_x100);
+
+    // Release a latched landing if an external disturbance moves the ball well
+    // outside the capture band.  This prevents HOLD from masking a large error.
+    if(s_landing_hold_active &&
+       (error_abs > ((s_landing_move_direction < 0) ?
+            POSITION_LANDING_RELEASE_LEFT_X100 :
+            POSITION_LANDING_RELEASE_RIGHT_X100)))
+    {
+        s_landing_hold_active = 0U;
+        s_landing_capture_armed = 1U;
+        s_landing_catch_frames_remaining = 0U;
+        s_landing_catch_angle_x100 = 0U;
+        s_landing_catch_cancel_x100 = 0U;
+        s_landing_best_error_x100 = error_abs;
+        s_landing_trim_active = 0U;
+        s_landing_trim_frames = 0U;
+        s_landing_trim_cooldown_frames = 0U;
+        s_landing_trim_attempts = 0U;
+        s_landing_trim_no_motion_retries = 0U;
+        s_landing_trim_angle_x100 = 0;
+        s_landing_trim_start_position_x100 = 0;
+        s_landing_ceiling_guard_active = 0U;
+        s_speed_i_accumulator = 0;
+        s_speed_i_term_x100 = 0;
+    }
+
+    if(s_landing_capture_armed &&
+       (error_abs < s_landing_best_error_x100))
+    {
+        s_landing_best_error_x100 = error_abs;
+    }
+
+    // Camera velocity is filtered and can lag the physical turning point.  A
+    // 0.05cm retreat from the best position therefore provides a second,
+    // position-only landing detector while the ball is still inside 1.00cm.
+    if(s_landing_capture_armed &&
+       (((error_abs <= POSITION_LANDING_BAND_X100) &&
+         (velocity_abs <= POSITION_LANDING_SPEED_X100)) ||
+        ((s_landing_best_error_x100 <= POSITION_LANDING_BAND_X100) &&
+         (error_abs >= (s_landing_best_error_x100 +
+            POSITION_LANDING_RETREAT_X100)) &&
+         (velocity_abs <= POSITION_LANDING_RETREAT_SPEED_X100) &&
+         (error_abs <= POSITION_LANDING_MAX_ERROR_X100))))
+    {
+        s_landing_capture_armed = 0U;
+        s_landing_hold_active = 1U;
+        s_landing_trim_active = 0U;
+        s_landing_trim_frames = 0U;
+        s_landing_trim_cooldown_frames = 0U;
+        s_landing_trim_attempts = 0U;
+        s_landing_trim_no_motion_retries = 0U;
+        s_landing_trim_angle_x100 = 0;
+        s_landing_ceiling_guard_active = 0U;
+        if(s_landing_move_direction > 0)
+        {
+            s_landing_catch_frames_remaining =
+                POSITION_HOLD_CATCH_RIGHT_FRAMES;
+            s_landing_catch_angle_x100 =
+                POSITION_HOLD_CATCH_RIGHT_ANGLE_X100;
+            s_landing_catch_cancel_x100 =
+                POSITION_HOLD_CATCH_RIGHT_CANCEL_X100;
+        }
+        else
+        {
+            s_landing_catch_frames_remaining =
+                POSITION_HOLD_CATCH_LEFT_FRAMES;
+            s_landing_catch_angle_x100 =
+                POSITION_HOLD_CATCH_LEFT_ANGLE_X100;
+            s_landing_catch_cancel_x100 =
+                POSITION_HOLD_CATCH_LEFT_CANCEL_X100;
+        }
+        landing_just_captured = 1U;
+    }
+    if(s_landing_hold_active)
+    {
+        // HOLD remains a quiet closed loop.  A small position request lets the
+        // speed integrator learn the mechanism's real support angle instead of
+        // assuming that encoder-relative 0deg is physically level.
+        s_position_p_term_x100 =
+            (s_position_error_x100 * POSITION_HOLD_KP_X100) / 100;
+        s_position_i_accumulator = 0;
+        s_position_i_term_x100 = 0;
+        s_position_d_term_x100 = 0;
+        s_ball_target_velocity_x100 = int32_clamp(s_position_p_term_x100,
+            -POSITION_HOLD_SPEED_LIMIT_X100,
+            POSITION_HOLD_SPEED_LIMIT_X100);
+        s_position_output_limited =
+            (s_ball_target_velocity_x100 != s_position_p_term_x100) ? 1U : 0U;
+        s_position_target_crossed = 0U;
+
+        s_speed_stiction_detect_count = 0U;
+        s_speed_stiction_active = 0U;
+        s_speed_stiction_active_frames = 0U;
+        s_speed_stiction_direction = 0;
+        s_speed_stiction_start_position_x100 = 0;
+        s_speed_stiction_launch_angle_x100 = 0;
+        s_speed_stiction_retry_level = 0U;
+        s_speed_stiction_blocked = 0U;
+
+        // Each endpoint uses a directional overshoot guard.  The same trim
+        // state machine then applies short, position-released breakaway pulses
+        // toward the target without changing the already tuned X+ parameters.
+        if(s_landing_move_direction > 0)
+        {
+            if((!s_landing_ceiling_guard_active) &&
+               (s_position_error_x100 <=
+                    -POSITION_HOLD_RIGHT_CEILING_ENTER_X100))
+            {
+                s_landing_ceiling_guard_active = 1U;
+                s_landing_catch_frames_remaining = 0U;
+                s_landing_catch_angle_x100 = 0U;
+                s_landing_catch_cancel_x100 = 0U;
+                s_landing_trim_active = 0U;
+                s_landing_trim_frames = 0U;
+                s_landing_trim_no_motion_retries = 0U;
+                s_landing_trim_angle_x100 = 0;
+                s_speed_i_accumulator = 0;
+                s_speed_i_term_x100 = 0;
+            }
+            else if(s_landing_ceiling_guard_active &&
+                    (s_position_error_x100 >=
+                        -POSITION_HOLD_RIGHT_CEILING_EXIT_X100))
+            {
+                s_landing_ceiling_guard_active = 0U;
+                s_speed_i_accumulator = 0;
+                s_speed_i_term_x100 = 0;
+            }
+        }
+        else if(s_landing_move_direction < 0)
+        {
+            if((!s_landing_ceiling_guard_active) &&
+               (s_position_error_x100 >=
+                    POSITION_HOLD_LEFT_FLOOR_ENTER_X100))
+            {
+                s_landing_ceiling_guard_active = 1U;
+                s_landing_catch_frames_remaining = 0U;
+                s_landing_catch_angle_x100 = 0U;
+                s_landing_catch_cancel_x100 = 0U;
+                s_landing_trim_active = 0U;
+                s_landing_trim_frames = 0U;
+                s_landing_trim_no_motion_retries = 0U;
+                s_landing_trim_angle_x100 = 0;
+                s_speed_i_accumulator = 0;
+                s_speed_i_term_x100 = 0;
+            }
+            else if(s_landing_ceiling_guard_active &&
+                    (s_position_error_x100 <=
+                        POSITION_HOLD_LEFT_FLOOR_EXIT_X100))
+            {
+                s_landing_ceiling_guard_active = 0U;
+                s_speed_i_accumulator = 0;
+                s_speed_i_term_x100 = 0;
+            }
+        }
+
+        if(s_landing_trim_cooldown_frames > 0U)
+        {
+            s_landing_trim_cooldown_frames --;
+        }
+        if(s_landing_trim_active)
+        {
+            s_landing_trim_frames ++;
+            landing_trim_displacement_x100 = s_camera_position_x100 -
+                s_landing_trim_start_position_x100;
+            landing_trim_stop_reached =
+                (((s_landing_move_direction > 0) &&
+                    (s_position_error_x100 <=
+                        POSITION_HOLD_RIGHT_TRIM_STOP_X100)) ||
+                 ((s_landing_move_direction < 0) &&
+                    (s_position_error_x100 >=
+                        -POSITION_HOLD_LEFT_TRIM_STOP_X100))) ? 1U : 0U;
+            landing_trim_directional_motion =
+                (((s_landing_move_direction > 0) &&
+                    ((landing_trim_displacement_x100 >=
+                        POSITION_HOLD_RIGHT_TRIM_DISTANCE_X100) ||
+                     (s_camera_velocity_x100 >=
+                        POSITION_HOLD_RIGHT_TRIM_SPEED_X100))) ||
+                 ((s_landing_move_direction < 0) &&
+                    ((landing_trim_displacement_x100 <=
+                        -POSITION_HOLD_RIGHT_TRIM_DISTANCE_X100) ||
+                     (s_camera_velocity_x100 <=
+                        -POSITION_HOLD_RIGHT_TRIM_SPEED_X100)))) ? 1U : 0U;
+            if(landing_trim_stop_reached ||
+               s_landing_ceiling_guard_active)
+            {
+                s_landing_trim_active = 0U;
+                s_landing_trim_frames = 0U;
+                s_landing_trim_cooldown_frames = 0U;
+                s_landing_trim_no_motion_retries = 0U;
+                s_landing_trim_angle_x100 = 0;
+                landing_seed_support_integral();
+            }
+            else if(landing_trim_directional_motion)
+            {
+                // Measured motion toward the active endpoint is the primary
+                // safety release for either direction.
+                s_landing_trim_active = 0U;
+                s_landing_trim_frames = 0U;
+                s_landing_trim_cooldown_frames =
+                    POSITION_HOLD_RIGHT_TRIM_COOLDOWN_FRAMES;
+                s_landing_trim_angle_x100 = 0;
+                // Keep the angle level that produced motion, and immediately
+                // return to the measured support bias instead of dropping to
+                // a weak proportional-only command that lets the ball roll back.
+                landing_seed_support_integral();
+            }
+            else if(s_landing_trim_frames >=
+                    POSITION_HOLD_RIGHT_TRIM_FRAMES)
+            {
+                // A no-motion attempt is also time bounded.  Retry after one
+                // camera frame, up to the global attempt limit.
+                s_landing_trim_active = 0U;
+                s_landing_trim_frames = 0U;
+                s_landing_trim_cooldown_frames = 1U;
+                if(s_landing_trim_no_motion_retries < 255U)
+                {
+                    s_landing_trim_no_motion_retries ++;
+                }
+                s_landing_trim_angle_x100 = 0;
+                s_speed_i_accumulator = 0;
+                s_speed_i_term_x100 = 0;
+            }
+        }
+        landing_trim_start_valid =
+            (((s_landing_move_direction > 0) &&
+                (s_position_error_x100 >
+                    POSITION_HOLD_RIGHT_TRIM_START_X100) &&
+                (s_camera_velocity_x100 <=
+                    POSITION_HOLD_RIGHT_TRIM_SPEED_X100)) ||
+             ((s_landing_move_direction < 0) &&
+                (s_position_error_x100 <
+                    -POSITION_HOLD_LEFT_TRIM_START_X100) &&
+                (s_camera_velocity_x100 >=
+                    -POSITION_HOLD_RIGHT_TRIM_SPEED_X100))) ? 1U : 0U;
+        if((!s_landing_trim_active) &&
+           (!s_landing_ceiling_guard_active) &&
+           (0U == s_landing_catch_frames_remaining) &&
+           (0U == s_landing_trim_cooldown_frames) &&
+           landing_trim_start_valid &&
+           (s_landing_trim_attempts <
+                POSITION_HOLD_RIGHT_TRIM_MAX_ATTEMPTS))
+        {
+            s_landing_trim_active = 1U;
+            s_landing_trim_frames = 0U;
+            s_landing_trim_attempts ++;
+            s_landing_trim_start_position_x100 = s_camera_position_x100;
+            landing_trim_base_x100 = (s_landing_move_direction > 0) ?
+                POSITION_HOLD_RIGHT_TRIM_BASE_X100 :
+                POSITION_HOLD_LEFT_TRIM_BASE_X100;
+            landing_trim_step_x100 = (s_landing_move_direction > 0) ?
+                POSITION_HOLD_RIGHT_TRIM_STEP_X100 :
+                POSITION_HOLD_LEFT_TRIM_STEP_X100;
+            landing_trim_max_x100 = (s_landing_move_direction > 0) ?
+                POSITION_HOLD_RIGHT_TRIM_MAX_X100 :
+                POSITION_HOLD_LEFT_TRIM_MAX_X100;
+            s_landing_trim_angle_x100 = landing_trim_base_x100 +
+                (int32)s_landing_trim_no_motion_retries *
+                    landing_trim_step_x100;
+            if(s_landing_trim_angle_x100 > landing_trim_max_x100)
+            {
+                s_landing_trim_angle_x100 = landing_trim_max_x100;
+            }
+            s_speed_i_accumulator = 0;
+            s_speed_i_term_x100 = 0;
+        }
+
+        if(landing_just_captured)
+        {
+            s_speed_i_accumulator = 0;
+            s_speed_i_term_x100 = 0;
+            s_speed_filtered_accel_x100 = 0;
+            s_speed_last_velocity_x100 = s_camera_velocity_x100;
+        }
+        raw_accel_x100 = ((s_camera_velocity_x100 -
+            s_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
+        raw_accel_x100 = int32_clamp(raw_accel_x100,
+            -SPEED_PID_ACCEL_LIMIT_X100, SPEED_PID_ACCEL_LIMIT_X100);
+        s_speed_filtered_accel_x100 +=
+            (raw_accel_x100 - s_speed_filtered_accel_x100) / 4;
+        s_speed_last_velocity_x100 = s_camera_velocity_x100;
+
+        s_speed_error_x100 = s_ball_target_velocity_x100 -
+            s_camera_velocity_x100;
+        s_speed_p_term_x100 =
+            (s_speed_error_x100 * SPEED_PID_KP_X100) / 100;
+        s_speed_d_term_x100 =
+            -(s_speed_filtered_accel_x100 * SPEED_PID_KD_X100) / 100;
+        command_without_new_i = s_speed_p_term_x100 +
+            s_speed_i_term_x100 + s_speed_d_term_x100;
+        if(int32_abs_to_uint32(command_without_new_i) <
+            POSITION_HOLD_ANGLE_LIMIT_X100)
+        {
+            candidate_accumulator = s_speed_i_accumulator +
+                s_speed_error_x100 * SPEED_PID_KI_X100 * (int32)delta_ms;
+            s_speed_i_accumulator = int32_clamp(candidate_accumulator,
+                -SPEED_PID_I_ACCUM_LIMIT, SPEED_PID_I_ACCUM_LIMIT);
+            s_speed_i_term_x100 =
+                s_speed_i_accumulator / PID_INTEGRAL_SCALE;
+        }
+
+        speed_effort_x100 = s_speed_p_term_x100 +
+            s_speed_i_term_x100 + s_speed_d_term_x100;
+        desired_angle_x100 = -speed_effort_x100;
+        hold_angle_limit_x100 = POSITION_HOLD_ANGLE_LIMIT_X100;
+        if(s_landing_catch_frames_remaining > 0U)
+        {
+            if(error_abs <= s_landing_catch_cancel_x100)
+            {
+                s_landing_catch_frames_remaining = 0U;
+                s_landing_catch_angle_x100 = 0U;
+                s_landing_catch_cancel_x100 = 0U;
+            }
+            else
+            {
+                hold_angle_limit_x100 = POSITION_HOLD_TRANSIENT_LIMIT_X100;
+                if((s_position_error_x100 > 0) &&
+                   (desired_angle_x100 > -(int32)s_landing_catch_angle_x100))
+                {
+                    desired_angle_x100 =
+                        -(int32)s_landing_catch_angle_x100;
+                }
+                else if((s_position_error_x100 < 0) &&
+                        (desired_angle_x100 <
+                            (int32)s_landing_catch_angle_x100))
+                {
+                    desired_angle_x100 =
+                        (int32)s_landing_catch_angle_x100;
+                }
+                s_landing_catch_frames_remaining --;
+                if(0U == s_landing_catch_frames_remaining)
+                {
+                    s_landing_catch_angle_x100 = 0U;
+                    s_landing_catch_cancel_x100 = 0U;
+                }
+            }
+        }
+        if(s_landing_trim_active)
+        {
+            desired_angle_x100 = (s_landing_move_direction > 0) ?
+                -s_landing_trim_angle_x100 : s_landing_trim_angle_x100;
+            hold_angle_limit_x100 = POSITION_HOLD_TRANSIENT_LIMIT_X100;
+        }
+        if(s_landing_ceiling_guard_active)
+        {
+            desired_angle_x100 = (s_landing_move_direction > 0) ?
+                POSITION_HOLD_RIGHT_CEILING_ANGLE_X100 :
+                POSITION_HOLD_LEFT_FLOOR_ANGLE_X100;
+            hold_angle_limit_x100 = POSITION_HOLD_TRANSIENT_LIMIT_X100;
+        }
+        s_speed_output_saturated = 0U;
+        if(desired_angle_x100 > hold_angle_limit_x100)
+        {
+            desired_angle_x100 = hold_angle_limit_x100;
+            s_speed_output_saturated = 1U;
+        }
+        else if(desired_angle_x100 < -hold_angle_limit_x100)
+        {
+            desired_angle_x100 = -hold_angle_limit_x100;
+            s_speed_output_saturated = 1U;
+        }
+        s_vision_angle_command_x100 = desired_angle_x100;
+        target_angle_delta_x100 = desired_angle_x100 -
+            s_stepper_target_x100;
+        target_angle_delta_x100 = int32_clamp(target_angle_delta_x100,
+            -VISION_BRAKE_ANGLE_SLEW_X100,
+            VISION_BRAKE_ANGLE_SLEW_X100);
+        s_stepper_target_x100 += target_angle_delta_x100;
+        s_direction_check_active = 0U;
+        return;
+    }
+
     settled = ((error_abs <= POSITION_SETTLE_BAND_X100) &&
         (velocity_abs <= SPEED_SETTLE_BAND_X100)) ? 1U : 0U;
 
@@ -786,12 +1328,22 @@ static void cascade_pid_update (void)
 
     s_position_p_term_x100 =
         (s_position_error_x100 * POSITION_PID_KP_X100) / 100;
+    if(s_position_error_x100 >= 0)
+    {
+        position_kd_x100 = POSITION_PID_KD_RIGHT_X100;
+        brake_accel_x100 = POSITION_BRAKE_ACCEL_RIGHT_X100;
+    }
+    else
+    {
+        position_kd_x100 = POSITION_PID_KD_LEFT_X100;
+        brake_accel_x100 = POSITION_BRAKE_ACCEL_LEFT_X100;
+    }
     // Derivative on measurement avoids a target-change derivative kick.
     s_position_d_term_x100 =
-        -(s_camera_velocity_x100 * POSITION_PID_KD_X100) / 100;
+        -(s_camera_velocity_x100 * position_kd_x100) / 100;
 
     brake_speed_x100 = integer_sqrt_u64(
-        (uint64)2U * POSITION_BRAKE_ACCEL_X100 * error_abs);
+        (uint64)2U * brake_accel_x100 * error_abs);
     if(brake_speed_x100 > POSITION_PID_SPEED_LIMIT_X100)
     {
         brake_speed_x100 = POSITION_PID_SPEED_LIMIT_X100;
@@ -1086,6 +1638,7 @@ static void stepper_disable_output (void)
 
 static void stepper_trip (stepper_fault_enum fault, const char *message)
 {
+    auto_run_cancel();
     s_vision_control_active = 0U;
     s_vision_ball_lost = 1U;
     s_manual_pulse_active = 0U;
@@ -1315,6 +1868,7 @@ static void vision_command_level (uint8 start_direction_check)
 
 static void vision_control_stop_to_level (const char *reason)
 {
+    auto_run_cancel();
     s_vision_control_active = 0U;
     s_vision_ball_lost = 1U;
     s_vision_sequence_seen = 0U;
@@ -1324,6 +1878,92 @@ static void vision_control_stop_to_level (const char *reason)
     vision_command_level(1U);
     wireless_debug_printf("VISION SAFE: %s; target=+0.00deg, motor en=%u\r\n",
         reason, s_stepper_enabled);
+}
+
+static void auto_run_update (void)
+{
+    uint16 elapsed_ms;
+    uint32 endpoint_error_abs;
+    uint32 right_error_abs;
+    uint8 result_pass;
+
+    if((AUTO_RUN_TO_RIGHT != s_auto_run_phase) &&
+       (AUTO_RUN_TO_LEFT != s_auto_run_phase))
+    {
+        return;
+    }
+
+    elapsed_ms = auto_run_elapsed_ms();
+    if((elapsed_ms > AUTO_RUN_TIME_LIMIT_MS) &&
+       (!s_auto_run_timeout_reported))
+    {
+        s_auto_run_timeout_reported = 1U;
+        wireless_debug_printf(
+            "AUTO TIME LIMIT EXCEEDED: %ums; control continues to -5cm\r\n",
+            elapsed_ms);
+    }
+
+    if(AUTO_RUN_TO_RIGHT == s_auto_run_phase)
+    {
+        endpoint_error_abs = int32_abs_to_uint32(
+            AUTO_RUN_RIGHT_TARGET_X100 - s_camera_position_x100);
+        if(s_landing_hold_active &&
+           (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100))
+        {
+            s_auto_run_right_ms = elapsed_ms;
+            s_auto_run_right_position_x100 = s_camera_position_x100;
+            wireless_debug_printf(
+                "AUTO TURN: x=+%u.%02ucm err=%u.%02ucm t=%ums; target=-5.00cm\r\n",
+                int32_abs_to_uint32(s_camera_position_x100) / 100U,
+                int32_abs_to_uint32(s_camera_position_x100) % 100U,
+                endpoint_error_abs / 100U, endpoint_error_abs % 100U,
+                elapsed_ms);
+            s_auto_run_phase = AUTO_RUN_TO_LEFT;
+            s_ball_target_position_x100 = AUTO_RUN_LEFT_TARGET_X100;
+            cascade_pid_reset();
+            s_vision_sequence_seen = 1U;
+            s_vision_last_sequence = s_camera_sequence;
+        }
+        return;
+    }
+
+    endpoint_error_abs = int32_abs_to_uint32(
+        AUTO_RUN_LEFT_TARGET_X100 - s_camera_position_x100);
+    if(s_landing_hold_active &&
+       (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100) &&
+       (int32_abs_to_uint32(s_camera_velocity_x100) <=
+            AUTO_RUN_FINAL_SPEED_X100) &&
+       (0U == s_landing_catch_frames_remaining) &&
+       (0U == s_landing_trim_active) &&
+       (0U == s_landing_ceiling_guard_active))
+    {
+        if(s_auto_run_final_stable_frames <
+            AUTO_RUN_FINAL_STABLE_FRAMES)
+        {
+            s_auto_run_final_stable_frames ++;
+        }
+    }
+    else
+    {
+        s_auto_run_final_stable_frames = 0U;
+    }
+    if(s_auto_run_final_stable_frames >=
+        AUTO_RUN_FINAL_STABLE_FRAMES)
+    {
+        right_error_abs = int32_abs_to_uint32(
+            AUTO_RUN_RIGHT_TARGET_X100 -
+                s_auto_run_right_position_x100);
+        result_pass = ((elapsed_ms <= AUTO_RUN_TIME_LIMIT_MS) &&
+            (right_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100) &&
+            (endpoint_error_abs <= AUTO_RUN_ENDPOINT_ERROR_X100)) ? 1U : 0U;
+        s_auto_run_phase = AUTO_RUN_COMPLETE;
+        wireless_debug_printf(
+            "AUTO %s: right_err=%u.%02ucm left_err=%u.%02ucm turn=%ums total=%ums\r\n",
+            result_pass ? "PASS" : "FAIL",
+            right_error_abs / 100U, right_error_abs % 100U,
+            endpoint_error_abs / 100U, endpoint_error_abs % 100U,
+            s_auto_run_right_ms, elapsed_ms);
+    }
 }
 
 static void vision_control_update (void)
@@ -1401,6 +2041,7 @@ static void vision_control_update (void)
     }
 
     cascade_pid_update();
+    auto_run_update();
 }
 
 //-------------------------------------------------------------------------------------------------------------------
@@ -1965,7 +2606,8 @@ static void vision_control_print_status (void)
         ((s_speed_stiction_last_direction < 0) ? 'L' : '-');
     stiction_launch_sign =
         (s_speed_stiction_last_launch_angle_x100 < 0) ? '-' : '+';
-    state = s_vision_ball_lost ? "REACQ" : "ACTIVE";
+    state = s_vision_ball_lost ? "REACQ" :
+        (s_landing_hold_active ? "HOLD" : "ACTIVE");
 
     wireless_debug_printf(
         "ctrl=%s x=%c%u.%02u xref=%c%u.%02u ex=%c%u.%02u v=%c%u.%02u vref=%c%u.%02u ev=%c%u.%02u\r\n",
@@ -1977,7 +2619,7 @@ static void vision_control_print_status (void)
         velocity_target_sign, velocity_target_abs / 100U, velocity_target_abs % 100U,
         speed_error_sign, speed_error_abs / 100U, speed_error_abs % 100U);
     wireless_debug_printf(
-        "angle_cmd=%c%u.%02u target=%c%u.%02u rel=%c%u.%02u step=%c%u lim=%u/%u cross=%u kick=%u/%c/%u events=%u boost=%c%u.%02u retry=%u block=%u age=%u\r\n",
+        "angle_cmd=%c%u.%02u target=%c%u.%02u rel=%c%u.%02u step=%c%u lim=%u/%u cross=%u kick=%u/%c/%u events=%u boost=%c%u.%02u retry=%u block=%u catch=%u trim=%u/%u guard=%u age=%u\r\n",
         angle_command_sign, angle_command_abs / 100U, angle_command_abs % 100U,
         angle_target_sign, angle_target_abs / 100U, angle_target_abs % 100U,
         relative_sign, relative_abs / 100U, relative_abs % 100U,
@@ -1987,7 +2629,88 @@ static void vision_control_print_status (void)
         s_speed_stiction_active_frames, s_speed_stiction_event_count,
         stiction_launch_sign, stiction_launch_abs / 100U,
         stiction_launch_abs % 100U, s_speed_stiction_retry_level,
-        s_speed_stiction_blocked, s_camera_link_age);
+        s_speed_stiction_blocked, s_landing_catch_frames_remaining,
+        s_landing_trim_active, s_landing_trim_attempts,
+        s_landing_ceiling_guard_active, s_camera_link_age);
+}
+
+//-------------------------------------------------------------------------------------------------------------------
+// Function brief      Store a compact sample for offline motion/braking analysis
+// Remarks             Capture is RAM-only so blocking wireless UART output cannot disturb the control timing
+//-------------------------------------------------------------------------------------------------------------------
+static void diagnostic_log_capture_sample (void)
+{
+    diagnostic_sample_struct *sample;
+    int32 position_error_x100;
+
+    if(!s_diagnostic_log_enabled)
+    {
+        return;
+    }
+    if(s_diagnostic_sequence_seen &&
+       (s_diagnostic_last_sequence == s_camera_sequence))
+    {
+        return;
+    }
+
+    s_diagnostic_last_sequence = s_camera_sequence;
+    s_diagnostic_sequence_seen = 1U;
+    if(s_diagnostic_sample_count >= DIAGNOSTIC_LOG_CAPACITY)
+    {
+        s_diagnostic_log_full = 1U;
+        return;
+    }
+
+    position_error_x100 = s_ball_target_position_x100 -
+        s_camera_position_x100;
+    sample = &s_diagnostic_samples[s_diagnostic_sample_count];
+    sample->capture_ms = s_camera_capture_ms_low16;
+    sample->position_x100 = (int16)s_camera_position_x100;
+    sample->velocity_x100 = (int16)s_camera_velocity_x100;
+    sample->target_position_x100 = (int16)s_ball_target_position_x100;
+    sample->position_error_x100 = (int16)position_error_x100;
+    sample->target_velocity_x100 = (int16)s_ball_target_velocity_x100;
+    sample->angle_command_x100 = (int16)s_vision_angle_command_x100;
+    sample->relative_angle_x100 = (int16)s_encoder_total_x100;
+    sample->step_frequency_pps = (int16)s_stepper_frequency_pps;
+    sample->sequence = s_camera_sequence;
+    sample->measurement_valid = s_camera_measurement_valid;
+    sample->stiction_active = s_speed_stiction_active ||
+        s_landing_trim_active || s_landing_ceiling_guard_active;
+    sample->stiction_blocked = s_speed_stiction_blocked;
+    sample->landing_hold = s_landing_hold_active;
+    sample->position_limited = s_position_output_limited;
+    sample->speed_limited = s_speed_output_saturated;
+    sample->fault = (uint8)s_stepper_fault;
+    s_diagnostic_sample_count ++;
+}
+
+static void diagnostic_log_dump (void)
+{
+    diagnostic_sample_struct *sample;
+    uint16 index;
+
+    wireless_debug_printf(
+        "DLOG DUMP count=%u full=%u; x100 units\r\n"
+        "D,t,seq,valid,x,v,xref,ex,vref,angle,rel,step,kick,block,hold,plim,slim,fault\r\n",
+        s_diagnostic_sample_count, s_diagnostic_log_full);
+    for(index = 0U; index < s_diagnostic_sample_count; index ++)
+    {
+        sample = &s_diagnostic_samples[index];
+        wireless_debug_printf(
+            "D,%u,%u,%u,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u\r\n",
+            sample->capture_ms, sample->sequence,
+            sample->measurement_valid, sample->position_x100,
+            sample->velocity_x100, sample->target_position_x100,
+            sample->position_error_x100, sample->target_velocity_x100,
+            sample->angle_command_x100, sample->relative_angle_x100,
+            sample->step_frequency_pps, sample->stiction_active,
+            sample->stiction_blocked, sample->landing_hold,
+            sample->position_limited, sample->speed_limited, sample->fault);
+    }
+    wireless_debug_printf("DLOG DUMP END\r\n");
+    s_diagnostic_sample_count = 0U;
+    s_diagnostic_log_full = 0U;
 }
 
 static void wireless_print_help (void)
@@ -1995,6 +2718,8 @@ static void wireless_print_help (void)
     wireless_debug_printf("Commands: Z=zero(level), E=enable, V=vision ON, M=manual/level\r\n");
     wireless_debug_printf("          P+=right pulse, P-=left pulse; motion/angle/max500ms stop\r\n");
     wireless_debug_printf("          X+5/X-5/X0=ball target(cm); T+10/T-10/T0=manual angle\r\n");
+    wireless_debug_printf("          A=auto O->+5cm->-5cm; endpoints<=1cm, total<=5s\r\n");
+    wireless_debug_printf("          D1=25Hz RAM log ON; after test send S then D0 to dump CSV\r\n");
 }
 
 static void wireless_execute_command (const char *command)
@@ -2023,6 +2748,7 @@ static void wireless_execute_command (const char *command)
             }
             else
             {
+                auto_run_cancel();
                 s_encoder_total_x100 = 0;
                 s_encoder_wrap_count = 0;
                 s_encoder_last_x100 = s_encoder_single_x100;
@@ -2078,6 +2804,7 @@ static void wireless_execute_command (const char *command)
         case 's':
         case 'S':
         {
+            auto_run_cancel();
             s_vision_control_active = 0U;
             s_vision_ball_lost = 1U;
             s_manual_pulse_active = 0U;
@@ -2160,6 +2887,7 @@ static void wireless_execute_command (const char *command)
             }
             else
             {
+                auto_run_cancel();
                 s_ball_target_position_x100 = requested_target;
                 cascade_pid_reset();
                 if(s_vision_control_active)
@@ -2174,6 +2902,51 @@ static void wireless_execute_command (const char *command)
                     "BALL TARGET SET: %c%u.%02ucm, cascade=%s\r\n",
                     current_sign, current_abs / 100U, current_abs % 100U,
                     s_vision_control_active ? "ACTIVE" : "OFF");
+            }
+        }break;
+
+        case 'a':
+        case 'A':
+        {
+            if('\0' != command[1])
+            {
+                wireless_debug_printf("A format error; use A only\r\n");
+            }
+            else if((!s_stepper_enabled) || (!s_vision_control_active) ||
+                    s_vision_ball_lost)
+            {
+                wireless_debug_printf(
+                    "A rejected: send E and V, then wait for ACTIVE\r\n");
+            }
+            else if((s_camera_link_age > VISION_LINK_TIMEOUT_LOOPS) ||
+                    (!s_camera_measurement_valid))
+            {
+                wireless_debug_printf("A rejected: camera/ball is not valid\r\n");
+            }
+            else if(int32_abs_to_uint32(s_camera_position_x100) >
+                    AUTO_RUN_START_POSITION_X100)
+            {
+                wireless_debug_printf(
+                    "A rejected: place ball within +/-0.50cm of O\r\n");
+            }
+            else if(int32_abs_to_uint32(s_camera_velocity_x100) >
+                    AUTO_RUN_START_SPEED_X100)
+            {
+                wireless_debug_printf(
+                    "A rejected: wait until ball speed <=0.50cm/s\r\n");
+            }
+            else
+            {
+                auto_run_cancel();
+                s_auto_run_phase = AUTO_RUN_TO_RIGHT;
+                s_auto_run_start_ms = s_camera_capture_ms_low16;
+                s_ball_target_position_x100 =
+                    AUTO_RUN_RIGHT_TARGET_X100;
+                cascade_pid_reset();
+                s_vision_sequence_seen = 1U;
+                s_vision_last_sequence = s_camera_sequence;
+                wireless_debug_printf(
+                    "AUTO START: O->+5.00cm->-5.00cm, limit=5000ms\r\n");
             }
         }break;
 
@@ -2278,6 +3051,7 @@ static void wireless_execute_command (const char *command)
             }
             else
             {
+                auto_run_cancel();
                 vision_command_level(0U);
                 s_vision_control_active = 1U;
                 s_vision_ball_lost = 1U;
@@ -2295,6 +3069,7 @@ static void wireless_execute_command (const char *command)
         case 'm':
         case 'M':
         {
+            auto_run_cancel();
             s_vision_control_active = 0U;
             s_vision_ball_lost = 1U;
             s_vision_sequence_seen = 0U;
@@ -2305,6 +3080,43 @@ static void wireless_execute_command (const char *command)
             vision_command_level(1U);
             wireless_debug_printf("MANUAL/LEVEL MODE: target=+0.00deg, motor en=%u\r\n",
                 s_stepper_enabled);
+        }break;
+
+        case 'd':
+        case 'D':
+        {
+            if((command[1] == '1') && ('\0' == command[2]))
+            {
+                s_diagnostic_log_enabled = 1U;
+                s_diagnostic_sequence_seen = 0U;
+                s_diagnostic_sample_count = 0U;
+                s_diagnostic_log_full = 0U;
+                wireless_debug_printf(
+                    "DLOG RECORDING 25Hz to RAM; capacity=896 samples; control unchanged\r\n");
+            }
+            else if((command[1] == '0') && ('\0' == command[2]))
+            {
+                s_diagnostic_log_enabled = 0U;
+                s_diagnostic_sequence_seen = 0U;
+                if(s_stepper_enabled)
+                {
+                    wireless_debug_printf(
+                        "DLOG STOPPED count=%u; send S, then D0 again to dump safely\r\n",
+                        s_diagnostic_sample_count);
+                }
+                else if(s_diagnostic_sample_count > 0U)
+                {
+                    diagnostic_log_dump();
+                }
+                else
+                {
+                    wireless_debug_printf("DLOG OFF: no stored samples\r\n");
+                }
+            }
+            else
+            {
+                wireless_debug_printf("D format error; use D1 or D0\r\n");
+            }
         }break;
 
         case 'h':
@@ -2417,9 +3229,19 @@ int main (void)
     wireless_debug_printf("Encoder PWM=B10, STEP=B12, DIR=B13, EN=B8(high=enable)\r\n");
     wireless_debug_printf("Vision UART2: B15=TX, B16=RX, 115200\r\n");
     wireless_debug_printf("Cascade PID: position -> target speed -> beam angle\r\n");
-    wireless_debug_printf("Pos Kp=3.50 Ki=0.08 Kd=1.00, vmax=20cm/s, brake=15cm/s2\r\n");
+    wireless_debug_printf("Pos Kp=3.50 Ki=0.08; X+ Kd=0.30/brake=9, X- Kd=1.00/brake=15\r\n");
+    wireless_debug_printf("Position speed limit=20cm/s\r\n");
     wireless_debug_printf("Speed Kp=0.80 Ki=0.10 Kd=0.03, angle limit=+/-8deg\r\n");
     wireless_debug_printf("Fast response: vref accel=200cm/s2, angle slew=1.2/2.0deg/frame\r\n");
+    wireless_debug_printf("Landing capture: <=0.95cm; low speed or retreat at <=2.00cm/s\r\n");
+    wireless_debug_printf("Landing catch: X+=4.60deg, X-=6.50deg; max500ms to +/-0.40cm\r\n");
+    wireless_debug_printf("X+ HOLD trim: adaptive 4.60..5.40deg, 0.05cm release, max16\r\n");
+    wireless_debug_printf("X+ trim release seeds 2.50deg I support to prevent rollback\r\n");
+    wireless_debug_printf("X+ ceiling guard: target+0.40cm enter, target+0.20cm exit\r\n");
+    wireless_debug_printf("X- HOLD trim: adaptive 6.50..8.00deg, 0.05cm release\r\n");
+    wireless_debug_printf("Auto A: O->+5->-5, endpoints<=1cm, stable total<=5000ms\r\n");
+    wireless_debug_printf("Landing hold: soft v<=1.5cm/s angle<=4deg; no kick\r\n");
+    wireless_debug_printf("Landing release: drift >1.20cm or next X target\r\n");
     wireless_debug_printf("Auto stiction: adaptive +/-4.6..6.5deg, step=0.25deg\r\n");
     wireless_debug_printf("Encoder filter: period+jump check, abs limit requires 5 samples\r\n");
     wireless_debug_printf("Pulse test: visual stop, rel stop +4.4/-4.2deg, max500ms\r\n");
@@ -2485,6 +3307,14 @@ int main (void)
         {
             // Avoid blocking wireless status output while timing a short pulse.
             status_counter = 0;
+        }
+        else if(s_diagnostic_log_enabled)
+        {
+            if(status_counter >= WIRELESS_DIAGNOSTIC_PERIOD_LOOPS)
+            {
+                status_counter = 0;
+                diagnostic_log_capture_sample();
+            }
         }
         else if(s_vision_control_active)
         {
