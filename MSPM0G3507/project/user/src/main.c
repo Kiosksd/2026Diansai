@@ -45,6 +45,7 @@
 #define STEPPER_STEP_PIN                     (B12)
 #define STEPPER_DIR_PIN                      (B13)
 #define STEPPER_EN_PIN                       (B8)
+#define MOTHERBOARD_BEEP_PIN                 (A14)  // MSPM0G3507 motherboard, active high
 #define STEPPER_STEP_PWM                     (PWM_TIM_A0_CH1_B12)
 #define STEPPER_PWM_CHANNEL_INDEX            (1U)
 #define STEPPER_PWM_CLOCK_HZ                 (1000000U)
@@ -297,6 +298,7 @@
 #define CUSTOM_CAPTURE_SPREAD_LIMIT_X100     (20)    // stable samples stay within 0.20cm
 #define CUSTOM_PREP_STABLE_FRAMES            (5U)
 #define CUSTOM_TARGET_ROUND_X100             (5)     // freeze target on a 0.05cm grid
+#define CUSTOM_READY_BEEP_DURATION_MS        (200U)  // short non-blocking S4-ready prompt
 
 #define PID_INTEGRAL_SCALE                   (100000)
 
@@ -683,6 +685,7 @@ static int32  s_custom_candidate_position_x100 = 0;
 static int32  s_custom_target_position_x100 = 0;
 static uint8  s_custom_candidate_valid = 0U;
 static uint8  s_custom_target_valid = 0U;
+static uint16 s_custom_ready_beep_remaining_ms = 0U;
 
 static int32  s_speed_error_x100 = 0;
 static int32  s_speed_p_term_x100 = 0;
@@ -5298,7 +5301,34 @@ static int32 custom_target_round (int32 position_x100)
             CUSTOM_TARGET_ROUND_X100) * CUSTOM_TARGET_ROUND_X100;
     }
     return -(((-position_x100 + CUSTOM_TARGET_ROUND_X100 / 2) /
-        CUSTOM_TARGET_ROUND_X100) * CUSTOM_TARGET_ROUND_X100);
+            CUSTOM_TARGET_ROUND_X100) * CUSTOM_TARGET_ROUND_X100);
+}
+
+static void custom_ready_beep_start (void)
+{
+    s_custom_ready_beep_remaining_ms = CUSTOM_READY_BEEP_DURATION_MS;
+    gpio_set_level(MOTHERBOARD_BEEP_PIN, GPIO_HIGH);
+}
+
+static void custom_ready_beep_update (void)
+{
+    // A ready prompt is meaningful only while the current stable candidate can
+    // actually be accepted by S4.  This also silences an interrupted capture.
+    if((CUSTOM_HOLD_CAPTURE != s_custom_hold_phase) ||
+       (!s_custom_candidate_valid))
+    {
+        s_custom_ready_beep_remaining_ms = 0U;
+    }
+
+    if(s_custom_ready_beep_remaining_ms > 0U)
+    {
+        gpio_set_level(MOTHERBOARD_BEEP_PIN, GPIO_HIGH);
+        s_custom_ready_beep_remaining_ms --;
+    }
+    else
+    {
+        gpio_set_level(MOTHERBOARD_BEEP_PIN, GPIO_LOW);
+    }
 }
 
 static void custom_capture_reset (void)
@@ -5440,6 +5470,7 @@ static void custom_capture_accept_frame (void)
         int32 candidate = custom_target_round(
             s_custom_candidate_position_x100);
         uint32 candidate_abs = int32_abs_to_uint32(candidate);
+        custom_ready_beep_start();
         wireless_debug_printf(
             "S3 TARGET READY: %c%u.%02ucm stable; press S4 to confirm\r\n",
             (candidate < 0) ? '-' : '+', candidate_abs / 100U,
@@ -5781,6 +5812,7 @@ int main (void)
     // 上电安全状态：先拉低 DIR/EN，再初始化 STEP 硬件 PWM 且强制输出低电平。
     gpio_init(STEPPER_DIR_PIN,  GPO, GPIO_LOW, GPO_PUSH_PULL);
     gpio_init(STEPPER_EN_PIN,   GPO, GPIO_LOW, GPO_PUSH_PULL);
+    gpio_init(MOTHERBOARD_BEEP_PIN, GPO, GPIO_LOW, GPO_PUSH_PULL);
     stepper_pwm_init();
 
     if(wireless_uart_init())
@@ -5891,6 +5923,7 @@ int main (void)
         competition_button_update();
         center_hold_button_update();
         custom_hold_button_update();
+        custom_ready_beep_update();
         vision_control_update();
         manual_pulse_update();
 
