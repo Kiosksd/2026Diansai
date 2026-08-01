@@ -1259,6 +1259,7 @@ int main (void)
 #define SAFE_TRACK_CONTROL_PERIOD_MS     ( 10 )
 #define SAFE_TRACK_PRINT_PERIOD_MS       ( 100 )
 #define SAFE_TRACK_DISPLAY_PERIOD_MS     ( 100 )
+#define SAFE_TRACK_WIRELESS_ENABLE       ( 0 )
 #define SAFE_TRACK_VOFA_COMMAND_SIZE     ( 32 )
 #define SAFE_TRACK_GS08RA_THRESHOLD      ( 30 )
 #define SAFE_TRACK_SENSOR_CHANNELS       ( 8 )
@@ -1299,6 +1300,14 @@ int main (void)
 #define SAFE_TRACK_LAP_COUNT_DEFAULT     \
     ( (SAFE_TRACK_ENCODER_COUNTS_PER_M * SAFE_TRACK_LAP_DISTANCE_MM) / 1000L )
 #define SAFE_TRACK_LAP_COUNT_MAX         ( 100000UL )
+
+#if SAFE_TRACK_WIRELESS_ENABLE
+#define SAFE_TRACK_SEND_STRING(text)     ((void)wireless_uart_send_string(text))
+#else
+// Wireless is optional. Keep status/report call sites readable while making
+// the default build completely independent of the module and its RTS pin.
+#define SAFE_TRACK_SEND_STRING(text)     ((void)(text))
+#endif
 
 typedef enum
 {
@@ -1354,9 +1363,11 @@ static volatile int16 safe_track_param_kd = SAFE_TRACK_PID_KD;
 // collecting calibration laps. This runtime setting is not saved to flash.
 static volatile uint32 safe_track_param_lap_count = SAFE_TRACK_LAP_COUNT_DEFAULT;
 
+#if SAFE_TRACK_WIRELESS_ENABLE
 static char safe_track_vofa_command[SAFE_TRACK_VOFA_COMMAND_SIZE];
 static uint8 safe_track_vofa_command_length = 0;
 static bool safe_track_vofa_command_receiving = false;
+#endif
 
 static void safe_track_integrals_reset (void)
 {
@@ -1395,6 +1406,7 @@ static int32 safe_track_distance_mm_get (int32 average_count)
             / SAFE_TRACK_ENCODER_COUNTS_PER_M;
 }
 
+#if SAFE_TRACK_WIRELESS_ENABLE
 static void safe_track_vofa_parameters_send (void)
 {
     char vofa_buffer[80];
@@ -1407,18 +1419,20 @@ static void safe_track_vofa_parameters_send (void)
         safe_track_param_kp,
         safe_track_param_ki,
         safe_track_param_kd);
-    wireless_uart_send_string(vofa_buffer);
+    SAFE_TRACK_SEND_STRING(vofa_buffer);
     sprintf(
         vofa_buffer,
         "lapcfg:%lu,%ld,%ld\n",
         (unsigned long)safe_track_param_lap_count,
         (long)SAFE_TRACK_ENCODER_COUNTS_PER_M,
         (long)SAFE_TRACK_LAP_DISTANCE_MM);
-    wireless_uart_send_string(vofa_buffer);
+    SAFE_TRACK_SEND_STRING(vofa_buffer);
 }
+#endif
 
 static void safe_track_vofa_telemetry_send (void)
 {
+#if SAFE_TRACK_WIRELESS_ENABLE
     char vofa_buffer[160];
     uint16 sensor_age_ms = 0;
     int32 left_total;
@@ -1445,7 +1459,7 @@ static void safe_track_vofa_telemetry_send (void)
         (long)safe_track_right_pwm,
         safe_track_black_count,
         sensor_age_ms);
-    wireless_uart_send_string(vofa_buffer);
+    SAFE_TRACK_SEND_STRING(vofa_buffer);
 
     safe_track_encoder_totals_snapshot(&left_total, &right_total);
     average_count = safe_track_average_count_get(left_total, right_total);
@@ -1458,9 +1472,11 @@ static void safe_track_vofa_telemetry_send (void)
         (long)average_count,
         (long)safe_track_distance_mm_get(average_count),
         (unsigned long)safe_track_param_lap_count);
-    wireless_uart_send_string(vofa_buffer);
+    SAFE_TRACK_SEND_STRING(vofa_buffer);
+#endif
 }
 
+#if SAFE_TRACK_WIRELESS_ENABLE
 static bool safe_track_vofa_uint_parse (const char *text, uint32 *value)
 {
     uint32 parsed_value = 0;
@@ -1559,7 +1575,7 @@ static void safe_track_vofa_command_execute (void)
     separator = strchr(safe_track_vofa_command, '=');
     if(NULL == separator)
     {
-        wireless_uart_send_string("ERR:USE @NAME=VALUE# OR @GET#\r\n");
+        SAFE_TRACK_SEND_STRING("ERR:USE @NAME=VALUE# OR @GET#\r\n");
         return;
     }
 
@@ -1568,7 +1584,7 @@ static void safe_track_vofa_command_execute (void)
     if(!safe_track_vofa_uint_parse(value_text, &value)
         || !safe_track_vofa_parameter_set(safe_track_vofa_command, value))
     {
-        wireless_uart_send_string("ERR:UNKNOWN PARAMETER OR VALUE OUT OF RANGE\r\n");
+        SAFE_TRACK_SEND_STRING("ERR:UNKNOWN PARAMETER OR VALUE OUT OF RANGE\r\n");
         return;
     }
 
@@ -1577,7 +1593,7 @@ static void safe_track_vofa_command_execute (void)
         "ACK:%s=%lu\r\n",
         safe_track_vofa_command,
         (unsigned long)value);
-    wireless_uart_send_string(response_buffer);
+    SAFE_TRACK_SEND_STRING(response_buffer);
     safe_track_vofa_parameters_send();
 }
 
@@ -1615,10 +1631,11 @@ static bool safe_track_vofa_command_byte_process (uint8 data)
     {
         safe_track_vofa_command_length = 0;
         safe_track_vofa_command_receiving = false;
-        wireless_uart_send_string("ERR:COMMAND TOO LONG\r\n");
+        SAFE_TRACK_SEND_STRING("ERR:COMMAND TOO LONG\r\n");
     }
     return true;
 }
+#endif
 
 static void safe_track_display_update (void)
 {
@@ -1938,9 +1955,9 @@ static void safe_track_stop (const char *reason)
     safe_track_display_update();
     safe_track_vofa_telemetry_send();
 
-    wireless_uart_send_string("STOP: ");
-    wireless_uart_send_string(reason);
-    wireless_uart_send_string("\r\n");
+    SAFE_TRACK_SEND_STRING("STOP: ");
+    SAFE_TRACK_SEND_STRING(reason);
+    SAFE_TRACK_SEND_STRING("\r\n");
 }
 
 static void safe_track_lap_stop_report (const char *reason)
@@ -1970,7 +1987,7 @@ static void safe_track_lap_stop_report (const char *reason)
         (unsigned long)recommended_scale_x1000,
         (unsigned long)((safe_track_active_base
             * recommended_scale_x1000 + 500UL) / 1000UL));
-    wireless_uart_send_string(report_buffer);
+    SAFE_TRACK_SEND_STRING(report_buffer);
     sprintf(
         report_buffer,
         "ODOM Ltotal=%ld Rtotal=%ld AVG=%ld DIST~%ldmm TARGET=%lu\r\n",
@@ -1979,7 +1996,7 @@ static void safe_track_lap_stop_report (const char *reason)
         (long)average_count,
         (long)safe_track_distance_mm_get(average_count),
         (unsigned long)safe_track_param_lap_count);
-    wireless_uart_send_string(report_buffer);
+    SAFE_TRACK_SEND_STRING(report_buffer);
 }
 
 static void safe_track_targets_update (void)
@@ -2047,7 +2064,7 @@ static bool safe_track_start (safe_track_mode_enum mode)
 
     if(safe_track_encoder_stop_pending)
     {
-        wireless_uart_send_string(
+        SAFE_TRACK_SEND_STRING(
             "START REFUSED: ENCODER STOP REPORT PENDING\r\n");
         return false;
     }
@@ -2058,14 +2075,14 @@ static bool safe_track_start (safe_track_mode_enum mode)
     if((0 == safe_track_sensor_frame_count)
         || (safe_track_sensor_age_ms >= SAFE_TRACK_SENSOR_TIMEOUT_MS))
     {
-        wireless_uart_send_string("START REFUSED: IR8 UART DATA TIMEOUT\r\n");
+        SAFE_TRACK_SEND_STRING("START REFUSED: IR8 UART DATA TIMEOUT\r\n");
         return false;
     }
 #endif
     safe_track_line_detected = safe_track_line_error_calculate(&safe_track_error);
     if(!safe_track_line_detected)
     {
-        wireless_uart_send_string("START REFUSED: NO BLACK LINE\r\n");
+        SAFE_TRACK_SEND_STRING("START REFUSED: NO BLACK LINE\r\n");
         return false;
     }
 
@@ -2111,6 +2128,7 @@ static bool safe_track_start (safe_track_mode_enum mode)
     return true;
 }
 
+#if SAFE_TRACK_WIRELESS_ENABLE
 static void safe_track_sensor_snapshot_send (char *send_buffer)
 {
     int16 sensor_error;
@@ -2178,21 +2196,26 @@ static void safe_track_sensor_snapshot_send (char *send_buffer)
         gs08ra_deal_val[7],
         gs08ra_threshold);
 #endif
-    wireless_uart_send_string(send_buffer);
+    SAFE_TRACK_SEND_STRING(send_buffer);
 }
+#endif
 
 int main (void)
 {
+#if SAFE_TRACK_WIRELESS_ENABLE
     uint8 receive_buffer[WIRELESS_UART_BUFFER_SIZE];
     char send_buffer[192];
     uint32 receive_length;
     uint32 receive_index;
+#endif
     uint16 print_elapsed_ms = 0;
     uint16 display_elapsed_ms = 0;
+#if SAFE_TRACK_WIRELESS_ENABLE
     int32 status_left_total;
     int32 status_right_total;
     int32 status_average_count;
     uint8 command;
+#endif
     key_state_enum key1_state;
     key_state_enum key2_state;
 #if SAFE_TRACK_USE_IR8_UART
@@ -2231,6 +2254,7 @@ int main (void)
     gs08ra_set_threshold(SAFE_TRACK_GS08RA_THRESHOLD);
 #endif
 
+#if SAFE_TRACK_WIRELESS_ENABLE
     if(wireless_uart_init())
     {
         printf("WIRELESS INIT FAILED. Motors remain stopped.\r\n");
@@ -2240,6 +2264,7 @@ int main (void)
             system_delay_ms(10);
         }
     }
+#endif
 
     pit_ms_init(
         SAFE_TRACK_CONTROL_PIT,
@@ -2253,6 +2278,7 @@ int main (void)
     line_sensor_ir8_uart_request_data();
 #endif
 
+#if SAFE_TRACK_WIRELESS_ENABLE
 #if SAFE_TRACK_USE_IR8_UART
     wireless_uart_send_string("\r\nIR8 UART HALF-SPEED LINE TRACK READY\r\n");
     wireless_uart_send_string("SENSOR: X1=PHYSICAL LEFT, X8=RIGHT, BLACK=0, WHITE=1\r\n");
@@ -2312,6 +2338,7 @@ int main (void)
     wireless_uart_send_string(
         "VOFA TUNE: @BASE=n# @KP=n# @KI=n# @KD=n# @LAP=count# @GET#\r\n");
     safe_track_vofa_parameters_send();
+#endif
 
     while(true)
     {
@@ -2371,6 +2398,7 @@ int main (void)
         safe_track_sensor_update();
 #endif
 
+#if SAFE_TRACK_WIRELESS_ENABLE
         receive_length = wireless_uart_read_buffer(
             receive_buffer,
             WIRELESS_UART_BUFFER_SIZE);
@@ -2509,6 +2537,7 @@ int main (void)
                 }break;
             }
         }
+#endif
 
         if(safe_track_running)
         {
