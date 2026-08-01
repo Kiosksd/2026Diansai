@@ -153,6 +153,20 @@
 #define S2_POSITION_BRAKE_RIGHT_X100         (900)
 #define S2_POSITION_BRAKE_LEFT_X100          (1500)
 
+// S3/S4 arbitrary-position hold profile.  These parameters and the matching
+// controller state are intentionally independent from S1, S2 and serial X/V.
+#define CUSTOM_POSITION_PID_KP_X100          (360)
+#define CUSTOM_POSITION_PID_KI_X100          (8)
+#define CUSTOM_POSITION_PID_KD_RIGHT_X100    (100)
+#define CUSTOM_POSITION_PID_KD_LEFT_X100     (100)
+#define CUSTOM_POSITION_PID_I_LIMIT_X100     (200)
+#define CUSTOM_POSITION_PID_SPEED_LIMIT_X100 (2000)
+#define CUSTOM_POSITION_BRAKE_RIGHT_X100     (900)
+#define CUSTOM_POSITION_BRAKE_LEFT_X100      (1500)
+#define CUSTOM_POSITION_SPEED_ACCEL_X100_PER_S (25000)
+#define CUSTOM_POSITION_SETTLE_BAND_X100     (5)
+#define CUSTOM_POSITION_INTEGRAL_FREEZE_X100 (20)
+
 #define POSITION_SPEED_ACCEL_X100_PER_S      (25000) // 目标球速加速斜率 200.00cm/s^2
 #define POSITION_SETTLE_BAND_X100            (5)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
@@ -266,6 +280,24 @@
 #define S2_SPEED_PID_NEG_ANGLE_X100          (1000)
 #define SPEED_SETTLE_BAND_X100               (15)    // 速度稳定带 +/-0.15cm/s
 
+#define CUSTOM_SPEED_PID_KP_X100             (100)
+#define CUSTOM_SPEED_PID_KI_X100             (10)
+#define CUSTOM_SPEED_PID_KD_X100             (5)
+#define CUSTOM_SPEED_PID_I_LIMIT_X100        (250)
+#define CUSTOM_SPEED_PID_ACCEL_LIMIT_X100    (5000)
+#define CUSTOM_SPEED_PID_POS_ANGLE_X100      (1000)
+#define CUSTOM_SPEED_PID_NEG_ANGLE_X100      (1000)
+#define CUSTOM_SPEED_SETTLE_BAND_X100        (15)
+
+// S3 captures a rolling stable coordinate; S4 freezes it and starts control.
+// Limit the first arbitrary-position task to the well calibrated central rail.
+#define CUSTOM_TARGET_LIMIT_X100             (800)
+#define CUSTOM_CAPTURE_STABLE_FRAMES         (15U)   // about 250~300ms at 50~60Hz
+#define CUSTOM_CAPTURE_SPEED_LIMIT_X100      (20)    // candidate must be below 0.20cm/s
+#define CUSTOM_CAPTURE_SPREAD_LIMIT_X100     (20)    // stable samples stay within 0.20cm
+#define CUSTOM_PREP_STABLE_FRAMES            (5U)
+#define CUSTOM_TARGET_ROUND_X100             (5)     // freeze target on a 0.05cm grid
+
 #define PID_INTEGRAL_SCALE                   (100000)
 
 // 加速时平缓改变摆角；需要制动时允许更快地反向倾斜。
@@ -357,6 +389,15 @@ typedef enum
     CENTER_HOLD_ACTIVE,
 } center_hold_phase_enum;
 
+typedef enum
+{
+    CUSTOM_HOLD_IDLE = 0,
+    CUSTOM_HOLD_CAPTURE,
+    CUSTOM_HOLD_WAIT_LEVEL,
+    CUSTOM_HOLD_WAIT_VISION,
+    CUSTOM_HOLD_ACTIVE,
+} custom_hold_phase_enum;
+
 // Top-level ownership of the shared camera, cascade controller and stepper.
 // KEY1 always owns APP_CONTROL_KEY1_FIXED; the original 8926ff0 controller is
 // retained as APP_CONTROL_GENERIC_8926 for serial commands and future tasks.
@@ -366,6 +407,7 @@ typedef enum
     APP_CONTROL_GENERIC_8926,
     APP_CONTROL_KEY1_FIXED,
     APP_CONTROL_KEY2_CENTER,
+    APP_CONTROL_KEY34_CUSTOM,
 } app_control_mode_enum;
 
 typedef enum
@@ -627,6 +669,20 @@ static uint8  s_center_hold_key_long_handled = 0U;
 static uint8  s_center_hold_sequence_seen = 0U;
 static uint8  s_center_hold_last_sequence = 0U;
 static uint8  s_center_hold_stable_frames = 0U;
+static custom_hold_phase_enum s_custom_hold_phase = CUSTOM_HOLD_IDLE;
+static uint8  s_custom_key3_long_handled = 0U;
+static uint8  s_custom_key4_long_handled = 0U;
+static uint8  s_custom_sequence_seen = 0U;
+static uint8  s_custom_last_sequence = 0U;
+static uint8  s_custom_prep_stable_frames = 0U;
+static uint8  s_custom_capture_sample_count = 0U;
+static int32  s_custom_capture_sum_x100 = 0;
+static int32  s_custom_capture_min_x100 = 0;
+static int32  s_custom_capture_max_x100 = 0;
+static int32  s_custom_candidate_position_x100 = 0;
+static int32  s_custom_target_position_x100 = 0;
+static uint8  s_custom_candidate_valid = 0U;
+static uint8  s_custom_target_valid = 0U;
 
 static int32  s_speed_error_x100 = 0;
 static int32  s_speed_p_term_x100 = 0;
@@ -650,6 +706,30 @@ static uint8  s_speed_stiction_retry_level = 0;
 static uint8  s_speed_stiction_blocked = 0;
 static int8   s_speed_stiction_last_direction = 0;
 static uint32 s_speed_stiction_event_count = 0;
+
+// Private S3/S4 cascade state.  Values are mirrored to the common diagnostic
+// fields after each update, but existing S1/S2 controllers never read these.
+static int32  s_custom_position_error_x100 = 0;
+static int32  s_custom_position_p_term_x100 = 0;
+static int32  s_custom_position_i_accumulator = 0;
+static int32  s_custom_position_i_term_x100 = 0;
+static int32  s_custom_position_d_term_x100 = 0;
+static int32  s_custom_target_velocity_x100 = 0;
+static int32  s_custom_position_previous_error_x100 = 0;
+static uint8  s_custom_position_error_seen = 0U;
+static uint8  s_custom_position_target_crossed = 0U;
+static uint8  s_custom_position_output_limited = 0U;
+static int32  s_custom_speed_error_x100 = 0;
+static int32  s_custom_speed_p_term_x100 = 0;
+static int32  s_custom_speed_i_accumulator = 0;
+static int32  s_custom_speed_i_term_x100 = 0;
+static int32  s_custom_speed_d_term_x100 = 0;
+static int32  s_custom_speed_filtered_accel_x100 = 0;
+static int32  s_custom_speed_last_velocity_x100 = 0;
+static uint8  s_custom_speed_output_saturated = 0U;
+static int32  s_custom_angle_command_x100 = 0;
+static uint16 s_custom_last_capture_ms = 0U;
+static uint8  s_custom_time_seen = 0U;
 static uint8  s_manual_pulse_active = 0;
 static uint32 s_manual_pulse_counter = 0;
 static int8   s_manual_pulse_direction = 0;
@@ -1113,6 +1193,39 @@ static void cascade_pid_reset (void)
     s_speed_stiction_blocked = 0U;
     s_speed_stiction_last_direction = 0;
     s_speed_stiction_event_count = 0U;
+}
+
+static void custom_pid_reset (void)
+{
+    s_custom_position_error_x100 = 0;
+    s_custom_position_p_term_x100 = 0;
+    s_custom_position_i_accumulator = 0;
+    s_custom_position_i_term_x100 = 0;
+    s_custom_position_d_term_x100 = 0;
+    s_custom_target_velocity_x100 = 0;
+    s_custom_position_previous_error_x100 = 0;
+    s_custom_position_error_seen = 0U;
+    s_custom_position_target_crossed = 0U;
+    s_custom_position_output_limited = 0U;
+    s_custom_speed_error_x100 = 0;
+    s_custom_speed_p_term_x100 = 0;
+    s_custom_speed_i_accumulator = 0;
+    s_custom_speed_i_term_x100 = 0;
+    s_custom_speed_d_term_x100 = 0;
+    s_custom_speed_filtered_accel_x100 = 0;
+    s_custom_speed_last_velocity_x100 = s_camera_velocity_x100;
+    s_custom_speed_output_saturated = 0U;
+    s_custom_angle_command_x100 = 0;
+    s_custom_last_capture_ms = 0U;
+    s_custom_time_seen = 0U;
+
+    if(APP_CONTROL_KEY34_CUSTOM == s_app_control_mode)
+    {
+        s_position_error_x100 = 0;
+        s_ball_target_velocity_x100 = 0;
+        s_speed_error_x100 = 0;
+        s_vision_angle_command_x100 = 0;
+    }
 }
 
 static int32 speed_stiction_launch_angle (int8 direction)
@@ -2437,9 +2550,302 @@ static void cascade_pid_update_enhanced (void)
     s_direction_check_active = 0U;
 }
 
+// Independent S3/S4 cascade controller.  It deliberately does not use the
+// S1/S2 landing, trim, final-range or stiction state, so every CUSTOM_* value
+// can be tuned without changing either proven task.
+static void custom_pid_update (void)
+{
+    uint16 delta_ms;
+    uint32 error_abs;
+    uint32 velocity_abs;
+    uint32 brake_speed_x100;
+    int32 position_kd_x100;
+    int32 position_brake_x100;
+    int32 candidate_accumulator;
+    int32 command_without_new_i;
+    int32 desired_velocity_x100;
+    int32 target_velocity_delta_x100;
+    int32 max_velocity_increase_x100;
+    int32 raw_accel_x100;
+    int32 speed_effort_x100;
+    int32 speed_integral_angle_limit_x100;
+    int32 desired_angle_x100;
+    int32 target_angle_delta_x100;
+    int32 angle_slew_limit_x100;
+    uint8 position_integral_allowed;
+    uint8 speed_integral_allowed;
+    uint8 settled;
+
+    if(!s_custom_time_seen)
+    {
+        delta_ms = CAMERA_NOMINAL_FRAME_PERIOD_MS;
+        s_custom_time_seen = 1U;
+        s_custom_speed_last_velocity_x100 = s_camera_velocity_x100;
+    }
+    else
+    {
+        delta_ms = (uint16)(s_camera_capture_ms_low16 -
+            s_custom_last_capture_ms);
+        if(delta_ms < 5U)
+        {
+            delta_ms = 5U;
+        }
+        else if(delta_ms > 50U)
+        {
+            delta_ms = 50U;
+        }
+    }
+    s_custom_last_capture_ms = s_camera_capture_ms_low16;
+
+    s_custom_position_error_x100 = s_custom_target_position_x100 -
+        s_camera_position_x100;
+    error_abs = int32_abs_to_uint32(s_custom_position_error_x100);
+    velocity_abs = int32_abs_to_uint32(s_camera_velocity_x100);
+    settled = ((error_abs <= CUSTOM_POSITION_SETTLE_BAND_X100) &&
+        (velocity_abs <= CUSTOM_SPEED_SETTLE_BAND_X100)) ? 1U : 0U;
+
+    s_custom_position_target_crossed = 0U;
+    if(s_custom_position_error_seen &&
+       (((s_custom_position_previous_error_x100 > 0) &&
+            (s_custom_position_error_x100 < 0)) ||
+        ((s_custom_position_previous_error_x100 < 0) &&
+            (s_custom_position_error_x100 > 0))))
+    {
+        s_custom_position_target_crossed = 1U;
+        s_custom_position_i_accumulator = 0;
+        s_custom_position_i_term_x100 = 0;
+        s_custom_speed_i_accumulator = 0;
+        s_custom_speed_i_term_x100 = 0;
+        s_custom_target_velocity_x100 = 0;
+    }
+    if(0 != s_custom_position_error_x100)
+    {
+        s_custom_position_previous_error_x100 =
+            s_custom_position_error_x100;
+        s_custom_position_error_seen = 1U;
+    }
+
+    if(s_custom_position_error_x100 >= 0)
+    {
+        position_kd_x100 = CUSTOM_POSITION_PID_KD_RIGHT_X100;
+        position_brake_x100 = CUSTOM_POSITION_BRAKE_RIGHT_X100;
+    }
+    else
+    {
+        position_kd_x100 = CUSTOM_POSITION_PID_KD_LEFT_X100;
+        position_brake_x100 = CUSTOM_POSITION_BRAKE_LEFT_X100;
+    }
+
+    s_custom_position_p_term_x100 =
+        (s_custom_position_error_x100 * CUSTOM_POSITION_PID_KP_X100) / 100;
+    s_custom_position_d_term_x100 =
+        -(s_camera_velocity_x100 * position_kd_x100) / 100;
+
+    brake_speed_x100 = integer_sqrt_u64(
+        (uint64)2U * (uint32)position_brake_x100 * error_abs);
+    if(brake_speed_x100 > CUSTOM_POSITION_PID_SPEED_LIMIT_X100)
+    {
+        brake_speed_x100 = CUSTOM_POSITION_PID_SPEED_LIMIT_X100;
+    }
+
+    command_without_new_i = s_custom_position_p_term_x100 +
+        s_custom_position_i_term_x100 + s_custom_position_d_term_x100;
+    position_integral_allowed =
+        (error_abs > CUSTOM_POSITION_INTEGRAL_FREEZE_X100) &&
+        (int32_abs_to_uint32(command_without_new_i) <
+            CUSTOM_POSITION_PID_SPEED_LIMIT_X100) &&
+        (int32_abs_to_uint32(command_without_new_i) < brake_speed_x100) &&
+        (((s_custom_position_error_x100 > 0) &&
+            (command_without_new_i >= 0)) ||
+         ((s_custom_position_error_x100 < 0) &&
+            (command_without_new_i <= 0)));
+    if(position_integral_allowed)
+    {
+        candidate_accumulator = s_custom_position_i_accumulator +
+            s_custom_position_error_x100 * CUSTOM_POSITION_PID_KI_X100 *
+                (int32)delta_ms;
+        s_custom_position_i_accumulator = int32_clamp(candidate_accumulator,
+            -(CUSTOM_POSITION_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE),
+            CUSTOM_POSITION_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE);
+        s_custom_position_i_term_x100 =
+            s_custom_position_i_accumulator / PID_INTEGRAL_SCALE;
+    }
+
+    desired_velocity_x100 = s_custom_position_p_term_x100 +
+        s_custom_position_i_term_x100 + s_custom_position_d_term_x100;
+    s_custom_position_output_limited = 0U;
+    if(settled || s_custom_position_target_crossed ||
+       (error_abs <= CUSTOM_POSITION_SETTLE_BAND_X100))
+    {
+        desired_velocity_x100 = 0;
+        s_custom_position_i_accumulator = 0;
+        s_custom_position_i_term_x100 = 0;
+    }
+    else if(s_custom_position_error_x100 > 0)
+    {
+        if(desired_velocity_x100 < 0)
+        {
+            desired_velocity_x100 = 0;
+            s_custom_position_output_limited = 1U;
+        }
+        if(desired_velocity_x100 > (int32)brake_speed_x100)
+        {
+            desired_velocity_x100 = (int32)brake_speed_x100;
+            s_custom_position_output_limited = 1U;
+        }
+    }
+    else
+    {
+        if(desired_velocity_x100 > 0)
+        {
+            desired_velocity_x100 = 0;
+            s_custom_position_output_limited = 1U;
+        }
+        if(desired_velocity_x100 < -(int32)brake_speed_x100)
+        {
+            desired_velocity_x100 = -(int32)brake_speed_x100;
+            s_custom_position_output_limited = 1U;
+        }
+    }
+    desired_velocity_x100 = int32_clamp(desired_velocity_x100,
+        -CUSTOM_POSITION_PID_SPEED_LIMIT_X100,
+        CUSTOM_POSITION_PID_SPEED_LIMIT_X100);
+
+    if((desired_velocity_x100 * s_custom_target_velocity_x100) < 0)
+    {
+        s_custom_target_velocity_x100 = 0;
+    }
+    else if(int32_abs_to_uint32(desired_velocity_x100) >
+            int32_abs_to_uint32(s_custom_target_velocity_x100))
+    {
+        max_velocity_increase_x100 =
+            (CUSTOM_POSITION_SPEED_ACCEL_X100_PER_S * (int32)delta_ms) /
+                1000;
+        if(max_velocity_increase_x100 < 1)
+        {
+            max_velocity_increase_x100 = 1;
+        }
+        target_velocity_delta_x100 = desired_velocity_x100 -
+            s_custom_target_velocity_x100;
+        target_velocity_delta_x100 = int32_clamp(target_velocity_delta_x100,
+            -max_velocity_increase_x100, max_velocity_increase_x100);
+        s_custom_target_velocity_x100 += target_velocity_delta_x100;
+    }
+    else
+    {
+        s_custom_target_velocity_x100 = desired_velocity_x100;
+    }
+
+    raw_accel_x100 = ((s_camera_velocity_x100 -
+        s_custom_speed_last_velocity_x100) * 1000) / (int32)delta_ms;
+    raw_accel_x100 = int32_clamp(raw_accel_x100,
+        -CUSTOM_SPEED_PID_ACCEL_LIMIT_X100,
+        CUSTOM_SPEED_PID_ACCEL_LIMIT_X100);
+    s_custom_speed_filtered_accel_x100 +=
+        (raw_accel_x100 - s_custom_speed_filtered_accel_x100) / 4;
+    s_custom_speed_last_velocity_x100 = s_camera_velocity_x100;
+
+    s_custom_speed_error_x100 = s_custom_target_velocity_x100 -
+        s_camera_velocity_x100;
+    s_custom_speed_p_term_x100 =
+        (s_custom_speed_error_x100 * CUSTOM_SPEED_PID_KP_X100) / 100;
+    s_custom_speed_d_term_x100 =
+        -(s_custom_speed_filtered_accel_x100 * CUSTOM_SPEED_PID_KD_X100) /
+            100;
+    command_without_new_i = s_custom_speed_p_term_x100 +
+        s_custom_speed_i_term_x100 + s_custom_speed_d_term_x100;
+    speed_integral_angle_limit_x100 = (command_without_new_i < 0) ?
+        CUSTOM_SPEED_PID_POS_ANGLE_X100 :
+        CUSTOM_SPEED_PID_NEG_ANGLE_X100;
+    speed_integral_allowed = (!settled) &&
+        (int32_abs_to_uint32(command_without_new_i) <
+            (uint32)speed_integral_angle_limit_x100);
+    if(speed_integral_allowed)
+    {
+        candidate_accumulator = s_custom_speed_i_accumulator +
+            s_custom_speed_error_x100 * CUSTOM_SPEED_PID_KI_X100 *
+                (int32)delta_ms;
+        s_custom_speed_i_accumulator = int32_clamp(candidate_accumulator,
+            -(CUSTOM_SPEED_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE),
+            CUSTOM_SPEED_PID_I_LIMIT_X100 * PID_INTEGRAL_SCALE);
+        s_custom_speed_i_term_x100 =
+            s_custom_speed_i_accumulator / PID_INTEGRAL_SCALE;
+    }
+
+    if(settled)
+    {
+        s_custom_speed_i_accumulator = 0;
+        s_custom_speed_i_term_x100 = 0;
+        speed_effort_x100 = 0;
+    }
+    else
+    {
+        speed_effort_x100 = s_custom_speed_p_term_x100 +
+            s_custom_speed_i_term_x100 + s_custom_speed_d_term_x100;
+    }
+
+    desired_angle_x100 = -speed_effort_x100;
+    s_custom_speed_output_saturated = 0U;
+    if(desired_angle_x100 > CUSTOM_SPEED_PID_POS_ANGLE_X100)
+    {
+        desired_angle_x100 = CUSTOM_SPEED_PID_POS_ANGLE_X100;
+        s_custom_speed_output_saturated = 1U;
+    }
+    else if(desired_angle_x100 < -CUSTOM_SPEED_PID_NEG_ANGLE_X100)
+    {
+        desired_angle_x100 = -CUSTOM_SPEED_PID_NEG_ANGLE_X100;
+        s_custom_speed_output_saturated = 1U;
+    }
+    s_custom_angle_command_x100 = desired_angle_x100;
+
+    if(((desired_angle_x100 * s_camera_velocity_x100) > 0) ||
+       (int32_abs_to_uint32(s_custom_target_velocity_x100) < velocity_abs) ||
+       s_custom_position_target_crossed)
+    {
+        angle_slew_limit_x100 = VISION_BRAKE_ANGLE_SLEW_X100;
+    }
+    else
+    {
+        angle_slew_limit_x100 = VISION_ACCEL_ANGLE_SLEW_X100;
+    }
+    target_angle_delta_x100 = desired_angle_x100 - s_stepper_target_x100;
+    target_angle_delta_x100 = int32_clamp(target_angle_delta_x100,
+        -angle_slew_limit_x100, angle_slew_limit_x100);
+    s_stepper_target_x100 += target_angle_delta_x100;
+    s_direction_check_active = 0U;
+
+    // Mirror the private controller output for the existing status/DLOG path.
+    s_position_error_x100 = s_custom_position_error_x100;
+    s_position_p_term_x100 = s_custom_position_p_term_x100;
+    s_position_i_term_x100 = s_custom_position_i_term_x100;
+    s_position_d_term_x100 = s_custom_position_d_term_x100;
+    s_position_output_limited = s_custom_position_output_limited;
+    s_position_target_crossed = s_custom_position_target_crossed;
+    s_ball_target_velocity_x100 = s_custom_target_velocity_x100;
+    s_speed_error_x100 = s_custom_speed_error_x100;
+    s_speed_p_term_x100 = s_custom_speed_p_term_x100;
+    s_speed_i_term_x100 = s_custom_speed_i_term_x100;
+    s_speed_d_term_x100 = s_custom_speed_d_term_x100;
+    s_speed_output_saturated = s_custom_speed_output_saturated;
+    s_vision_angle_command_x100 = s_custom_angle_command_x100;
+}
+
 static void cascade_pid_update (void)
 {
-    if((APP_CONTROL_KEY1_FIXED == s_app_control_mode) ||
+    if(APP_CONTROL_KEY34_CUSTOM == s_app_control_mode)
+    {
+        if(CUSTOM_HOLD_ACTIVE == s_custom_hold_phase)
+        {
+            custom_pid_update();
+        }
+        else
+        {
+            s_stepper_target_x100 = 0;
+            s_vision_angle_command_x100 = 0;
+            s_ball_target_velocity_x100 = 0;
+        }
+    }
+    else if((APP_CONTROL_KEY1_FIXED == s_app_control_mode) ||
        (APP_CONTROL_KEY2_CENTER == s_app_control_mode))
     {
         cascade_pid_update_enhanced();
@@ -2565,6 +2971,7 @@ static void stepper_trip (stepper_fault_enum fault, const char *message)
     s_vision_ball_lost = 1U;
     s_manual_pulse_active = 0U;
     cascade_pid_reset();
+    custom_pid_reset();
     stepper_disable_output();
     s_stepper_fault = fault;
     wireless_debug_printf("SAFETY STOP: %s\r\n", message);
@@ -2802,6 +3209,7 @@ static void vision_control_stop_to_level (const char *reason)
     s_vision_lost_frame_count = 0U;
     s_vision_reacquire_count = 0U;
     cascade_pid_reset();
+    custom_pid_reset();
     vision_command_level(1U);
     wireless_debug_printf("VISION SAFE: %s; target=+0.00deg, motor en=%u\r\n",
         reason, s_stepper_enabled);
@@ -2966,6 +3374,7 @@ static void vision_control_update (void)
         s_vision_control_active = 0U;
         s_vision_ball_lost = 1U;
         cascade_pid_reset();
+        custom_pid_reset();
         return;
     }
 
@@ -3000,6 +3409,7 @@ static void vision_control_update (void)
         {
             s_vision_ball_lost = 1U;
             cascade_pid_reset();
+            custom_pid_reset();
             vision_command_level(1U);
             wireless_debug_printf(
                 "VISION BALL LOST: target=+0.00deg, waiting for %u valid frames\r\n",
@@ -3024,6 +3434,7 @@ static void vision_control_update (void)
         s_vision_ball_lost = 0U;
         s_vision_reacquire_count = 0U;
         cascade_pid_reset();
+        custom_pid_reset();
         s_direction_check_active = 0U;
         wireless_debug_printf("VISION BALL REACQUIRED: control resumed\r\n");
     }
@@ -3844,9 +4255,9 @@ static void wireless_print_help (void)
     wireless_debug_printf("Commands: Z=zero(level), E=enable, V=vision ON, M=manual/level\r\n");
     wireless_debug_printf("          P+=right pulse, P-=left pulse; motion/angle/max500ms stop\r\n");
     wireless_debug_printf("          X+5/X-5/X0=ball target(cm); T+10/T-10/T0=manual angle\r\n");
-    wireless_debug_printf("          A=generic auto; S1=fixed competition; S2=hold O\r\n");
+    wireless_debug_printf("          A=generic auto; S1=fixed; S2=hold O; S3=capture/S4=confirm\r\n");
     wireless_debug_printf("          D1=25Hz RAM log ON; after test send S then D0 to dump CSV\r\n");
-    wireless_debug_printf("S1 short=fixed task; S2 short=hold O; hold either 1s=STOP\r\n");
+    wireless_debug_printf("S3 short=capture target; S4 short=confirm/start; hold S3/S4=STOP\r\n");
 }
 
 static void wireless_execute_command (const char *command)
@@ -3938,6 +4349,7 @@ static void wireless_execute_command (const char *command)
             s_vision_ball_lost = 1U;
             s_manual_pulse_active = 0U;
             cascade_pid_reset();
+            custom_pid_reset();
             stepper_disable_output();
             if(s_encoder_feedback_valid && s_stepper_zero_set)
             {
@@ -4014,11 +4426,17 @@ static void wireless_execute_command (const char *command)
             {
                 wireless_debug_printf("X rejected: calibrated range is +/-10.00cm\r\n");
             }
+            else if(APP_CONTROL_KEY34_CUSTOM == s_app_control_mode)
+            {
+                wireless_debug_printf(
+                    "X rejected: S3/S4 custom hold owns the frozen target\r\n");
+            }
             else
             {
                 auto_run_cancel();
                 if((APP_CONTROL_KEY1_FIXED != s_app_control_mode) &&
-                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode) &&
+                   (APP_CONTROL_KEY34_CUSTOM != s_app_control_mode))
                 {
                     s_app_control_mode = APP_CONTROL_GENERIC_8926;
                 }
@@ -4203,7 +4621,8 @@ static void wireless_execute_command (const char *command)
             {
                 auto_run_cancel();
                 if((APP_CONTROL_KEY1_FIXED != s_app_control_mode) &&
-                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode))
+                   (APP_CONTROL_KEY2_CENTER != s_app_control_mode) &&
+                   (APP_CONTROL_KEY34_CUSTOM != s_app_control_mode))
                 {
                     s_app_control_mode = APP_CONTROL_GENERIC_8926;
                 }
@@ -4215,6 +4634,7 @@ static void wireless_execute_command (const char *command)
                 s_vision_lost_frame_count = 0U;
                 s_vision_reacquire_count = 0U;
                 cascade_pid_reset();
+                custom_pid_reset();
                 s_direction_check_active = 0U;
                 wireless_debug_printf(
                     "CASCADE PID ARMED: position->speed, angle<=+/-8deg, X sets target\r\n");
@@ -4233,6 +4653,7 @@ static void wireless_execute_command (const char *command)
             s_vision_reacquire_count = 0U;
             s_manual_pulse_active = 0U;
             cascade_pid_reset();
+            custom_pid_reset();
             vision_command_level(1U);
             wireless_debug_printf("MANUAL/LEVEL MODE: target=+0.00deg, motor en=%u\r\n",
                 s_stepper_enabled);
@@ -4869,6 +5290,479 @@ static void center_hold_button_update (void)
     }
 }
 
+static int32 custom_target_round (int32 position_x100)
+{
+    if(position_x100 >= 0)
+    {
+        return ((position_x100 + CUSTOM_TARGET_ROUND_X100 / 2) /
+            CUSTOM_TARGET_ROUND_X100) * CUSTOM_TARGET_ROUND_X100;
+    }
+    return -(((-position_x100 + CUSTOM_TARGET_ROUND_X100 / 2) /
+        CUSTOM_TARGET_ROUND_X100) * CUSTOM_TARGET_ROUND_X100);
+}
+
+static void custom_capture_reset (void)
+{
+    s_custom_capture_sample_count = 0U;
+    s_custom_capture_sum_x100 = 0;
+    s_custom_capture_min_x100 = 0;
+    s_custom_capture_max_x100 = 0;
+    s_custom_candidate_position_x100 = 0;
+    s_custom_candidate_valid = 0U;
+}
+
+static void custom_prepare_reset (void)
+{
+    s_custom_sequence_seen = 1U;
+    s_custom_last_sequence = s_camera_sequence;
+    s_custom_prep_stable_frames = 0U;
+}
+
+static void custom_hold_state_reset (void)
+{
+    s_custom_hold_phase = CUSTOM_HOLD_IDLE;
+    custom_capture_reset();
+    custom_prepare_reset();
+    s_custom_target_valid = 0U;
+    custom_pid_reset();
+    if(APP_CONTROL_KEY34_CUSTOM == s_app_control_mode)
+    {
+        s_app_control_mode = APP_CONTROL_IDLE;
+    }
+}
+
+static uint8 custom_new_camera_frame (void)
+{
+    if((!s_custom_sequence_seen) ||
+       (s_camera_sequence != s_custom_last_sequence))
+    {
+        s_custom_sequence_seen = 1U;
+        s_custom_last_sequence = s_camera_sequence;
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint8 custom_camera_frame_valid (uint8 require_still)
+{
+    if((s_camera_link_age > VISION_LINK_TIMEOUT_LOOPS) ||
+       (!s_camera_measurement_valid) ||
+       (int32_abs_to_uint32(s_camera_position_x100) >
+            VISION_POSITION_LIMIT_X100) ||
+       (int32_abs_to_uint32(s_camera_velocity_x100) >
+            VISION_VELOCITY_LIMIT_X100))
+    {
+        return 0U;
+    }
+    if(require_still &&
+       (int32_abs_to_uint32(s_camera_velocity_x100) >
+            CUSTOM_CAPTURE_SPEED_LIMIT_X100))
+    {
+        return 0U;
+    }
+    return 1U;
+}
+
+static void custom_capture_accept_frame (void)
+{
+    int32 next_min_x100;
+    int32 next_max_x100;
+    uint8 candidate_was_valid = s_custom_candidate_valid;
+
+    if((!custom_camera_frame_valid(1U)) ||
+       (int32_abs_to_uint32(s_camera_position_x100) >
+            CUSTOM_TARGET_LIMIT_X100))
+    {
+        custom_capture_reset();
+        return;
+    }
+
+    if(0U == s_custom_capture_sample_count)
+    {
+        s_custom_capture_sample_count = 1U;
+        s_custom_capture_sum_x100 = s_camera_position_x100;
+        s_custom_capture_min_x100 = s_camera_position_x100;
+        s_custom_capture_max_x100 = s_camera_position_x100;
+        return;
+    }
+
+    if(s_custom_capture_sample_count < CUSTOM_CAPTURE_STABLE_FRAMES)
+    {
+        next_min_x100 = (s_camera_position_x100 <
+            s_custom_capture_min_x100) ? s_camera_position_x100 :
+                s_custom_capture_min_x100;
+        next_max_x100 = (s_camera_position_x100 >
+            s_custom_capture_max_x100) ? s_camera_position_x100 :
+                s_custom_capture_max_x100;
+        if((next_max_x100 - next_min_x100) >
+            CUSTOM_CAPTURE_SPREAD_LIMIT_X100)
+        {
+            custom_capture_reset();
+            s_custom_capture_sample_count = 1U;
+            s_custom_capture_sum_x100 = s_camera_position_x100;
+            s_custom_capture_min_x100 = s_camera_position_x100;
+            s_custom_capture_max_x100 = s_camera_position_x100;
+            return;
+        }
+
+        s_custom_capture_min_x100 = next_min_x100;
+        s_custom_capture_max_x100 = next_max_x100;
+        s_custom_capture_sum_x100 += s_camera_position_x100;
+        s_custom_capture_sample_count ++;
+        if(s_custom_capture_sample_count >= CUSTOM_CAPTURE_STABLE_FRAMES)
+        {
+            s_custom_candidate_position_x100 =
+                s_custom_capture_sum_x100 /
+                    (int32)CUSTOM_CAPTURE_STABLE_FRAMES;
+            s_custom_candidate_valid = 1U;
+        }
+    }
+    else if(int32_abs_to_uint32(s_camera_position_x100 -
+                s_custom_candidate_position_x100) <=
+            CUSTOM_CAPTURE_SPREAD_LIMIT_X100)
+    {
+        // Follow only slow sub-0.20cm settling motion; any larger move resets
+        // the window so the path used to place the ball is never averaged in.
+        s_custom_candidate_position_x100 +=
+            (s_camera_position_x100 - s_custom_candidate_position_x100) / 4;
+    }
+    else
+    {
+        custom_capture_reset();
+        s_custom_capture_sample_count = 1U;
+        s_custom_capture_sum_x100 = s_camera_position_x100;
+        s_custom_capture_min_x100 = s_camera_position_x100;
+        s_custom_capture_max_x100 = s_camera_position_x100;
+    }
+
+    if((!candidate_was_valid) && s_custom_candidate_valid)
+    {
+        int32 candidate = custom_target_round(
+            s_custom_candidate_position_x100);
+        uint32 candidate_abs = int32_abs_to_uint32(candidate);
+        wireless_debug_printf(
+            "S3 TARGET READY: %c%u.%02ucm stable; press S4 to confirm\r\n",
+            (candidate < 0) ? '-' : '+', candidate_abs / 100U,
+            candidate_abs % 100U);
+    }
+}
+
+static void custom_capture_start_from_button (void)
+{
+    if(CUSTOM_HOLD_CAPTURE == s_custom_hold_phase)
+    {
+        custom_capture_reset();
+        custom_prepare_reset();
+        wireless_debug_printf(
+            "S3 CAPTURE RESTARTED: place ball, wait still, then press S4\r\n");
+        return;
+    }
+    if(CUSTOM_HOLD_IDLE != s_custom_hold_phase)
+    {
+        wireless_debug_printf(
+            "S3 ignored: custom hold is already starting/running; hold S3/S4 to stop\r\n");
+        return;
+    }
+    if((COMPETITION_IDLE != s_competition_phase) ||
+       (CENTER_HOLD_IDLE != s_center_hold_phase) ||
+       (APP_CONTROL_IDLE != s_app_control_mode) ||
+       s_stepper_enabled || s_vision_control_active)
+    {
+        wireless_debug_printf(
+            "S3 rejected: another task or motor/vision is active; stop it first\r\n");
+        return;
+    }
+    if((!s_encoder_feedback_valid) || (!g_ms42_pwm_signal_ok) ||
+       (s_encoder_feedback_age > STEPPER_FEEDBACK_TIMEOUT_LOOPS))
+    {
+        wireless_debug_printf("S3 rejected: encoder PWM is not valid\r\n");
+        return;
+    }
+    if(!custom_camera_frame_valid(0U))
+    {
+        wireless_debug_printf("S3 rejected: camera/ball is not valid\r\n");
+        return;
+    }
+
+    // The operator levels the beam before S3.  Capture that mechanical zero
+    // now, before the ball is moved and before S4 can disturb the mechanism.
+    s_app_control_mode = APP_CONTROL_KEY34_CUSTOM;
+    wireless_execute_command("Z");
+    if(!s_stepper_zero_set)
+    {
+        custom_hold_state_reset();
+        return;
+    }
+
+    s_custom_hold_phase = CUSTOM_HOLD_CAPTURE;
+    s_custom_target_valid = 0U;
+    custom_capture_reset();
+    custom_prepare_reset();
+    custom_pid_reset();
+    wireless_debug_printf(
+        "S3 CAPTURE: zero saved; place ball within +/-8.00cm and wait still\r\n");
+}
+
+static void custom_target_confirm_from_button (void)
+{
+    uint32 target_abs;
+
+    if(CUSTOM_HOLD_CAPTURE != s_custom_hold_phase)
+    {
+        wireless_debug_printf("S4 ignored: press S3 to enter target capture first\r\n");
+        return;
+    }
+    if((!s_custom_candidate_valid) ||
+       (!custom_camera_frame_valid(1U)) ||
+       (int32_abs_to_uint32(s_camera_position_x100 -
+            s_custom_candidate_position_x100) >
+                CUSTOM_CAPTURE_SPREAD_LIMIT_X100))
+    {
+        wireless_debug_printf(
+            "S4 WAIT: target is not stable; keep ball still and press S4 again\r\n");
+        return;
+    }
+
+    s_custom_target_position_x100 = custom_target_round(
+        s_custom_candidate_position_x100);
+    if(int32_abs_to_uint32(s_custom_target_position_x100) >
+        CUSTOM_TARGET_LIMIT_X100)
+    {
+        wireless_debug_printf("S4 rejected: target must be within +/-8.00cm\r\n");
+        return;
+    }
+    s_custom_target_valid = 1U;
+    s_ball_target_position_x100 = s_custom_target_position_x100;
+    s_stepper_target_x100 = 0;
+    custom_pid_reset();
+
+    wireless_execute_command("E");
+    if(!s_stepper_enabled)
+    {
+        custom_hold_state_reset();
+        wireless_debug_printf("S4 START ABORTED: motor enable rejected\r\n");
+        return;
+    }
+
+    s_custom_hold_phase = CUSTOM_HOLD_WAIT_LEVEL;
+    custom_prepare_reset();
+    target_abs = int32_abs_to_uint32(s_custom_target_position_x100);
+    wireless_debug_printf(
+        "S4 TARGET CONFIRMED: %c%u.%02ucm; returning beam to saved level\r\n",
+        (s_custom_target_position_x100 < 0) ? '-' : '+',
+        target_abs / 100U, target_abs % 100U);
+}
+
+static void custom_hold_button_update (void)
+{
+    key_state_enum key3_state = key_get_state(KEY_3);
+    key_state_enum key4_state = key_get_state(KEY_4);
+    uint8 new_camera_frame;
+
+    if(KEY_RELEASE == key3_state)
+    {
+        s_custom_key3_long_handled = 0U;
+    }
+    else if(KEY_LONG_PRESS == key3_state)
+    {
+        if((CUSTOM_HOLD_IDLE != s_custom_hold_phase) &&
+           (!s_custom_key3_long_handled))
+        {
+            s_custom_key3_long_handled = 1U;
+            wireless_execute_command("S");
+            custom_hold_state_reset();
+            wireless_debug_printf("S3 CUSTOM HOLD STOP\r\n");
+        }
+        return;
+    }
+
+    if(KEY_RELEASE == key4_state)
+    {
+        s_custom_key4_long_handled = 0U;
+    }
+    else if(KEY_LONG_PRESS == key4_state)
+    {
+        if((CUSTOM_HOLD_IDLE != s_custom_hold_phase) &&
+           (!s_custom_key4_long_handled))
+        {
+            s_custom_key4_long_handled = 1U;
+            wireless_execute_command("S");
+            custom_hold_state_reset();
+            wireless_debug_printf("S4 CUSTOM HOLD STOP\r\n");
+        }
+        return;
+    }
+
+    if(KEY_SHORT_PRESS == key3_state)
+    {
+        key_clear_state(KEY_3);
+        custom_capture_start_from_button();
+        return;
+    }
+    if(KEY_SHORT_PRESS == key4_state)
+    {
+        key_clear_state(KEY_4);
+        custom_target_confirm_from_button();
+    }
+
+    new_camera_frame = custom_new_camera_frame();
+    switch(s_custom_hold_phase)
+    {
+        case CUSTOM_HOLD_CAPTURE:
+        {
+            if((APP_CONTROL_KEY34_CUSTOM != s_app_control_mode) ||
+               s_stepper_enabled || s_vision_control_active)
+            {
+                if(s_vision_control_active)
+                {
+                    vision_control_stop_to_level("custom capture ownership lost");
+                }
+                else if(s_stepper_enabled)
+                {
+                    s_stepper_target_x100 = 0;
+                }
+                custom_hold_state_reset();
+                wireless_debug_printf("S3 CAPTURE ABORTED: control mode changed\r\n");
+            }
+            else if(new_camera_frame)
+            {
+                custom_capture_accept_frame();
+            }
+        }break;
+
+        case CUSTOM_HOLD_WAIT_LEVEL:
+        {
+            if((APP_CONTROL_KEY34_CUSTOM != s_app_control_mode) ||
+               (!s_stepper_enabled) || (!s_custom_target_valid))
+            {
+                custom_hold_state_reset();
+                wireless_debug_printf("S4 PREP ABORTED: motor/mode changed\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if(custom_camera_frame_valid(0U) &&
+               (int32_abs_to_uint32(s_encoder_total_x100) <=
+                    COMPETITION_LEVEL_BAND_X100) &&
+               (0 == s_stepper_frequency_pps))
+            {
+                if(s_custom_prep_stable_frames < CUSTOM_PREP_STABLE_FRAMES)
+                {
+                    s_custom_prep_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_custom_prep_stable_frames = 0U;
+            }
+
+            if(s_custom_prep_stable_frames >= CUSTOM_PREP_STABLE_FRAMES)
+            {
+                s_ball_target_position_x100 =
+                    s_custom_target_position_x100;
+                wireless_execute_command("V");
+                if(s_vision_control_active &&
+                   (APP_CONTROL_KEY34_CUSTOM == s_app_control_mode))
+                {
+                    s_custom_hold_phase = CUSTOM_HOLD_WAIT_VISION;
+                    custom_prepare_reset();
+                    wireless_debug_printf(
+                        "S4 PREP: level stable; waiting for vision ACTIVE\r\n");
+                }
+                else
+                {
+                    custom_hold_state_reset();
+                    wireless_debug_printf(
+                        "S4 PREP ABORTED: vision arm rejected\r\n");
+                }
+            }
+        }break;
+
+        case CUSTOM_HOLD_WAIT_VISION:
+        {
+            if(APP_CONTROL_KEY34_CUSTOM != s_app_control_mode)
+            {
+                if(s_vision_control_active)
+                {
+                    vision_control_stop_to_level("custom hold ownership lost");
+                }
+                custom_hold_state_reset();
+                wireless_debug_printf("S4 PREP ABORTED: control mode changed\r\n");
+                break;
+            }
+            if((!s_stepper_enabled) || (!s_vision_control_active))
+            {
+                custom_hold_state_reset();
+                wireless_debug_printf("S4 PREP ABORTED: vision/motor stopped\r\n");
+                break;
+            }
+            if(!new_camera_frame)
+            {
+                break;
+            }
+            if((!s_vision_ball_lost) && custom_camera_frame_valid(0U))
+            {
+                if(s_custom_prep_stable_frames < CUSTOM_PREP_STABLE_FRAMES)
+                {
+                    s_custom_prep_stable_frames ++;
+                }
+            }
+            else
+            {
+                s_custom_prep_stable_frames = 0U;
+            }
+
+            if(s_custom_prep_stable_frames >= CUSTOM_PREP_STABLE_FRAMES)
+            {
+                auto_run_cancel();
+                s_ball_target_position_x100 =
+                    s_custom_target_position_x100;
+                custom_pid_reset();
+                s_custom_hold_phase = CUSTOM_HOLD_ACTIVE;
+                wireless_debug_printf(
+                    "S4 CUSTOM HOLD ACTIVE: target=%c%u.%02ucm; hold S3/S4 to stop\r\n",
+                    (s_custom_target_position_x100 < 0) ? '-' : '+',
+                    int32_abs_to_uint32(s_custom_target_position_x100) / 100U,
+                    int32_abs_to_uint32(s_custom_target_position_x100) % 100U);
+            }
+        }break;
+
+        case CUSTOM_HOLD_ACTIVE:
+        {
+            if((APP_CONTROL_KEY34_CUSTOM != s_app_control_mode) ||
+               (!s_custom_target_valid))
+            {
+                if(s_vision_control_active)
+                {
+                    vision_control_stop_to_level("custom hold ownership lost");
+                }
+                custom_hold_state_reset();
+                wireless_debug_printf("S4 CUSTOM HOLD ABORTED: ownership lost\r\n");
+            }
+            else if((!s_stepper_enabled) || (!s_vision_control_active))
+            {
+                custom_hold_state_reset();
+                wireless_debug_printf("S4 CUSTOM HOLD ABORTED\r\n");
+            }
+            else if(s_ball_target_position_x100 !=
+                    s_custom_target_position_x100)
+            {
+                // The custom task owns its frozen target until explicit stop.
+                s_ball_target_position_x100 =
+                    s_custom_target_position_x100;
+                custom_pid_reset();
+            }
+        }break;
+
+        case CUSTOM_HOLD_IDLE:
+        default:
+        {
+        }break;
+    }
+}
+
 
 int main (void)
 {
@@ -4910,7 +5804,7 @@ int main (void)
     wireless_debug_printf("Cascade PID: position -> target speed -> beam angle\r\n");
     wireless_debug_printf("Generic 8926ff0: Pos Kp=3.50 Ki=0.08 Kd=1.00, brake=15\r\n");
     wireless_debug_printf("S1 fixed profile: X- Kd=0.55, brake=15, internal target=-5.20cm\r\n");
-    wireless_debug_printf("Modes: KEY1=fixed task; KEY2=center hold; serial X/V/A=generic 8926ff0\r\n");
+    wireless_debug_printf("Modes: S1=fixed; S2=center; S3/S4=custom position; X/V/A=generic\r\n");
     wireless_debug_printf("S2 profile: Pos Kp=3.50 Ki=0.08 Kd=0.30/1.00, target=0.00cm\r\n");
     wireless_debug_printf("Position speed limit=20cm/s\r\n");
     wireless_debug_printf("Speed Kp=0.80 Ki=0.10 Kd=0.03, angle limit=+/-8deg\r\n");
@@ -4935,6 +5829,7 @@ int main (void)
     wireless_debug_printf("Pulse test: visual stop, rel stop +4.4/-4.2deg, max500ms\r\n");
     wireless_debug_printf("Boot: motor/vision OFF. Level beam; S1 also requires ball at O.\r\n");
     wireless_debug_printf("S1=fixed task; S2=return/hold O; hold either key 1s=STOP.\r\n");
+    wireless_debug_printf("S3=capture arbitrary target; S4=confirm/start; custom range +/-8cm.\r\n");
     wireless_debug_printf("Limits: target +/-20deg, test trip +/-25deg, absolute 121~208deg\r\n");
     wireless_print_help();
     wireless_tx_flush_blocking();
@@ -4995,6 +5890,7 @@ int main (void)
         }
         competition_button_update();
         center_hold_button_update();
+        custom_hold_button_update();
         vision_control_update();
         manual_pulse_update();
 
