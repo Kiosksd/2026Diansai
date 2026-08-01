@@ -1289,9 +1289,16 @@ int main (void)
 #define SAFE_TRACK_BASE_RISE_X100        ( 25 )
 #define SAFE_TRACK_BASE_FALL_X100        ( 50 )
 #define SAFE_TRACK_LAP_TARGET_MS         ( 20000 )
-#define SAFE_TRACK_LAP_MINIMUM_MS        ( 12000 )
-#define SAFE_TRACK_FINISH_BLACK_MIN      ( 4 )
+#define SAFE_TRACK_FINISH_ENABLE_MS      ( 10000 )
+#define SAFE_TRACK_FINISH_BLACK_MIN      ( 3 )
 #define SAFE_TRACK_FINISH_CONFIRM_TICKS  ( 1 )
+// Initial odometry estimate only: archived code estimated about 750 counts
+// per 100 mm. Recalibrate this value for the current motor, wheel and tyre.
+#define SAFE_TRACK_ENCODER_COUNTS_PER_M  ( 7500L )
+#define SAFE_TRACK_LAP_DISTANCE_MM       ( 6142L )
+#define SAFE_TRACK_LAP_COUNT_DEFAULT     \
+    ( (SAFE_TRACK_ENCODER_COUNTS_PER_M * SAFE_TRACK_LAP_DISTANCE_MM) / 1000L )
+#define SAFE_TRACK_LAP_COUNT_MAX         ( 100000UL )
 
 typedef enum
 {
@@ -1301,6 +1308,8 @@ typedef enum
 
 static volatile int16 safe_track_left_count = 0;
 static volatile int16 safe_track_right_count = 0;
+static volatile int32 safe_track_left_total_count = 0;
+static volatile int32 safe_track_right_total_count = 0;
 static volatile int16 safe_track_left_target = 0;
 static volatile int16 safe_track_right_target = 0;
 static volatile int32 safe_track_left_pwm = 0;
@@ -1308,6 +1317,7 @@ static volatile int32 safe_track_right_pwm = 0;
 static volatile int32 safe_track_left_integral = 0;
 static volatile int32 safe_track_right_integral = 0;
 static volatile bool safe_track_running = false;
+static volatile bool safe_track_encoder_stop_pending = false;
 static volatile uint32 safe_track_elapsed_ms = 0;
 
 static int16 safe_track_error = 0;
@@ -1340,6 +1350,9 @@ static volatile int16 safe_track_active_base = SAFE_TRACK_BASE_TARGET;
 static volatile int16 safe_track_param_kp = SAFE_TRACK_PID_KP;
 static volatile int16 safe_track_param_ki = SAFE_TRACK_PID_KI;
 static volatile int16 safe_track_param_kd = SAFE_TRACK_PID_KD;
+// Set to zero with @LAP=0# to disable encoder-distance stopping while
+// collecting calibration laps. This runtime setting is not saved to flash.
+static volatile uint32 safe_track_param_lap_count = SAFE_TRACK_LAP_COUNT_DEFAULT;
 
 static char safe_track_vofa_command[SAFE_TRACK_VOFA_COMMAND_SIZE];
 static uint8 safe_track_vofa_command_length = 0;
@@ -1350,6 +1363,36 @@ static void safe_track_integrals_reset (void)
     safe_track_left_integral = 0;
     safe_track_right_integral = 0;
     safe_track_error_integral = 0;
+}
+
+static void safe_track_encoder_totals_snapshot (
+    int32 *left_total,
+    int32 *right_total)
+{
+    uint32 primask;
+
+    primask = interrupt_global_disable();
+    *left_total = safe_track_left_total_count;
+    *right_total = safe_track_right_total_count;
+    interrupt_global_enable(primask);
+}
+
+static int32 safe_track_average_count_get (
+    int32 left_total,
+    int32 right_total)
+{
+    // Divide only after the full left/right totals have been accumulated.
+    // Dividing every 10 ms would repeatedly discard half-count remainders.
+    return (left_total + right_total) / 2L;
+}
+
+static int32 safe_track_distance_mm_get (int32 average_count)
+{
+    // Split quotient/remainder to avoid overflowing average_count * 1000
+    // during a long @LAP=0 calibration run.
+    return (average_count / SAFE_TRACK_ENCODER_COUNTS_PER_M) * 1000L
+        + ((average_count % SAFE_TRACK_ENCODER_COUNTS_PER_M) * 1000L)
+            / SAFE_TRACK_ENCODER_COUNTS_PER_M;
 }
 
 static void safe_track_vofa_parameters_send (void)
@@ -1365,12 +1408,22 @@ static void safe_track_vofa_parameters_send (void)
         safe_track_param_ki,
         safe_track_param_kd);
     wireless_uart_send_string(vofa_buffer);
+    sprintf(
+        vofa_buffer,
+        "lapcfg:%lu,%ld,%ld\n",
+        (unsigned long)safe_track_param_lap_count,
+        (long)SAFE_TRACK_ENCODER_COUNTS_PER_M,
+        (long)SAFE_TRACK_LAP_DISTANCE_MM);
+    wireless_uart_send_string(vofa_buffer);
 }
 
 static void safe_track_vofa_telemetry_send (void)
 {
     char vofa_buffer[160];
     uint16 sensor_age_ms = 0;
+    int32 left_total;
+    int32 right_total;
+    int32 average_count;
 
 #if SAFE_TRACK_USE_IR8_UART
     sensor_age_ms = safe_track_sensor_age_ms;
@@ -1392,6 +1445,19 @@ static void safe_track_vofa_telemetry_send (void)
         (long)safe_track_right_pwm,
         safe_track_black_count,
         sensor_age_ms);
+    wireless_uart_send_string(vofa_buffer);
+
+    safe_track_encoder_totals_snapshot(&left_total, &right_total);
+    average_count = safe_track_average_count_get(left_total, right_total);
+    // odom channels: Ltotal,Rtotal,average_count,estimated_mm,target_count
+    sprintf(
+        vofa_buffer,
+        "odom:%ld,%ld,%ld,%ld,%lu\n",
+        (long)left_total,
+        (long)right_total,
+        (long)average_count,
+        (long)safe_track_distance_mm_get(average_count),
+        (unsigned long)safe_track_param_lap_count);
     wireless_uart_send_string(vofa_buffer);
 }
 
@@ -1448,6 +1514,11 @@ static bool safe_track_vofa_parameter_set (const char *name, uint32 value)
     {
         safe_track_param_kd = (int16)value;
         track_pid_changed = true;
+    }
+    else if((0 == strcmp(name, "LAP"))
+        && (value <= SAFE_TRACK_LAP_COUNT_MAX))
+    {
+        safe_track_param_lap_count = value;
     }
     else
     {
@@ -1773,6 +1844,7 @@ static void safe_track_control_callback (uint32 event, void *ptr)
 {
     int16 raw_g8_count;
     int16 raw_g9_count;
+    int32 distance_sum_count;
 
     (void)event;
     (void)ptr;
@@ -1809,6 +1881,30 @@ static void safe_track_control_callback (uint32 event, void *ptr)
     // scans gray sensors and sends logs, so counting one nominal 10 ms period
     // per foreground iteration makes the reported lap time run too slowly.
     safe_track_elapsed_ms += SAFE_TRACK_CONTROL_PERIOD_MS;
+    safe_track_left_total_count += safe_track_left_count;
+    safe_track_right_total_count += safe_track_right_count;
+
+    // left_total + right_total is twice the driven-axle centre distance.
+    // Compare the undivided sum so odd half-counts are never discarded.
+    distance_sum_count = safe_track_left_total_count
+                       + safe_track_right_total_count;
+    if((0UL != safe_track_param_lap_count)
+        && (distance_sum_count
+            >= (2L * (int32)safe_track_param_lap_count)))
+    {
+        // Stop PWM in the 10 ms control interrupt for minimum latency. UART,
+        // display and the final report are deliberately deferred to main().
+        safe_track_encoder_stop_pending = true;
+        safe_track_running = false;
+        safe_track_left_target = 0;
+        safe_track_right_target = 0;
+        safe_track_left_pwm = 0;
+        safe_track_right_pwm = 0;
+        safe_track_left_integral = 0;
+        safe_track_right_integral = 0;
+        safe_test_motors_stop();
+        return;
+    }
 
     safe_track_left_pwm = safe_track_speed_pi_calculate(
         safe_track_left_target,
@@ -1825,7 +1921,11 @@ static void safe_track_control_callback (uint32 event, void *ptr)
 
 static void safe_track_stop (const char *reason)
 {
+    uint32 primask;
+
+    primask = interrupt_global_disable();
     safe_track_running = false;
+    safe_track_encoder_stop_pending = false;
     safe_track_ramped_base = 0;
     safe_track_ramped_base_x100 = 0;
     safe_track_left_target = 0;
@@ -1834,12 +1934,52 @@ static void safe_track_stop (const char *reason)
     safe_track_right_pwm = 0;
     safe_track_integrals_reset();
     safe_test_motors_stop();
+    interrupt_global_enable(primask);
     safe_track_display_update();
     safe_track_vofa_telemetry_send();
 
     wireless_uart_send_string("STOP: ");
     wireless_uart_send_string(reason);
     wireless_uart_send_string("\r\n");
+}
+
+static void safe_track_lap_stop_report (const char *reason)
+{
+    char report_buffer[192];
+    uint32 finished_lap_ms;
+    uint32 recommended_scale_x1000;
+    int32 left_total;
+    int32 right_total;
+    int32 average_count;
+
+    safe_track_stop(reason);
+    finished_lap_ms = safe_track_elapsed_ms;
+    recommended_scale_x1000 =
+        (finished_lap_ms * 1000UL) / SAFE_TRACK_LAP_TARGET_MS;
+    safe_track_encoder_totals_snapshot(&left_total, &right_total);
+    average_count = safe_track_average_count_get(left_total, right_total);
+
+    sprintf(
+        report_buffer,
+        "LAP time=%lums target=%ums black=%u peak=%u scale_x1000=%lu "
+        "NEXT BASE=%lu\r\n",
+        (unsigned long)finished_lap_ms,
+        SAFE_TRACK_LAP_TARGET_MS,
+        safe_track_black_count,
+        safe_track_black_peak,
+        (unsigned long)recommended_scale_x1000,
+        (unsigned long)((safe_track_active_base
+            * recommended_scale_x1000 + 500UL) / 1000UL));
+    wireless_uart_send_string(report_buffer);
+    sprintf(
+        report_buffer,
+        "ODOM Ltotal=%ld Rtotal=%ld AVG=%ld DIST~%ldmm TARGET=%lu\r\n",
+        (long)left_total,
+        (long)right_total,
+        (long)average_count,
+        (long)safe_track_distance_mm_get(average_count),
+        (unsigned long)safe_track_param_lap_count);
+    wireless_uart_send_string(report_buffer);
 }
 
 static void safe_track_targets_update (void)
@@ -1903,6 +2043,15 @@ static void safe_track_targets_update (void)
 
 static bool safe_track_start (safe_track_mode_enum mode)
 {
+    uint32 primask;
+
+    if(safe_track_encoder_stop_pending)
+    {
+        wireless_uart_send_string(
+            "START REFUSED: ENCODER STOP REPORT PENDING\r\n");
+        return false;
+    }
+
     safe_test_motors_stop();
     safe_track_sensor_update();
 #if SAFE_TRACK_USE_IR8_UART
@@ -1920,10 +2069,6 @@ static bool safe_track_start (safe_track_mode_enum mode)
         return false;
     }
 
-    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
-    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
-    safe_track_left_count = 0;
-    safe_track_right_count = 0;
     safe_track_left_pwm = 0;
     safe_track_right_pwm = 0;
     safe_track_ramped_base = 0;
@@ -1939,7 +2084,6 @@ static bool safe_track_start (safe_track_mode_enum mode)
         -SAFE_TRACK_STEER_LIMIT,
         SAFE_TRACK_STEER_LIMIT);
     safe_track_lost_ticks = 0;
-    safe_track_elapsed_ms = 0;
     safe_track_finish_ticks = 0;
     safe_track_black_count = 0;
     safe_track_black_peak = 0;
@@ -1948,7 +2092,20 @@ static bool safe_track_start (safe_track_mode_enum mode)
 #endif
     safe_track_left_target = 0;
     safe_track_right_target = 0;
+
+    // Reset the hardware interval counters and both odometry totals as one
+    // transaction, then expose the new run to the PIT callback.
+    primask = interrupt_global_disable();
+    encoder_clear_count(SAFE_TEST_ENCODER_G8_TIMER);
+    encoder_clear_count(SAFE_TEST_ENCODER_G9_TIMER);
+    safe_track_left_count = 0;
+    safe_track_right_count = 0;
+    safe_track_left_total_count = 0;
+    safe_track_right_total_count = 0;
+    safe_track_elapsed_ms = 0;
+    safe_track_encoder_stop_pending = false;
     safe_track_running = true;
+    interrupt_global_enable(primask);
     safe_track_display_update();
     safe_track_vofa_telemetry_send();
     return true;
@@ -2030,10 +2187,11 @@ int main (void)
     char send_buffer[192];
     uint32 receive_length;
     uint32 receive_index;
-    uint32 finished_lap_ms;
-    uint32 recommended_scale_x1000;
     uint16 print_elapsed_ms = 0;
     uint16 display_elapsed_ms = 0;
+    int32 status_left_total;
+    int32 status_right_total;
+    int32 status_average_count;
     uint8 command;
     key_state_enum key1_state;
     key_state_enum key2_state;
@@ -2132,11 +2290,17 @@ int main (void)
     wireless_uart_send_string(send_buffer);
     sprintf(
         send_buffer,
-        "TARGET LAP=%dms; AFTER %dms BLACK_CHANNELS>=%d FOR %dms -> STOP\r\n",
-        SAFE_TRACK_LAP_TARGET_MS,
-        SAFE_TRACK_LAP_MINIMUM_MS,
+        "STOP RULE: AVG_COUNT>=%lu; OR AFTER %dms BLACK_CHANNELS>=%d FOR %dms\r\n",
+        (unsigned long)safe_track_param_lap_count,
+        SAFE_TRACK_FINISH_ENABLE_MS,
         SAFE_TRACK_FINISH_BLACK_MIN,
         SAFE_TRACK_FINISH_CONFIRM_TICKS * SAFE_TRACK_CONTROL_PERIOD_MS);
+    wireless_uart_send_string(send_buffer);
+    sprintf(
+        send_buffer,
+        "ODOM ESTIMATE: %ld count/m, LAP=%ldmm; SET @LAP=count# (@LAP=0# DISABLES)\r\n",
+        (long)SAFE_TRACK_ENCODER_COUNTS_PER_M,
+        (long)SAFE_TRACK_LAP_DISTANCE_MM);
     wireless_uart_send_string(send_buffer);
 #if SAFE_TRACK_USE_IR8_UART
     wireless_uart_send_string("IR8 UART DATA TIMEOUT 100ms -> FORCED STOP\r\n");
@@ -2144,13 +2308,19 @@ int main (void)
     wireless_uart_send_string(
         "LOST LINE -> KEEP STRAIGHT AT BASE SPEED; NO LINE-LOSS STOP\r\n");
     wireless_uart_send_string(
-        "VOFA+ FIREWATER: car=12 channels, params=4 channels, 115200 baud\r\n");
+        "VOFA+ FIREWATER: car=12, odom=5, params=4, lapcfg=3 channels, 115200 baud\r\n");
     wireless_uart_send_string(
-        "VOFA TUNE: @BASE=n# @KP=n# @KI=n# @KD=n# @GET#\r\n");
+        "VOFA TUNE: @BASE=n# @KP=n# @KI=n# @KD=n# @LAP=count# @GET#\r\n");
     safe_track_vofa_parameters_send();
 
     while(true)
     {
+        if(safe_track_encoder_stop_pending)
+        {
+            safe_track_lap_stop_report("ENCODER LAP DISTANCE");
+            display_elapsed_ms = 0;
+        }
+
         key_scanner();
         key1_state = key_get_state(KEY_1);
         key2_state = key_get_state(KEY_2);
@@ -2304,6 +2474,21 @@ int main (void)
                         safe_track_right_count,
                         (long)safe_track_right_pwm);
                     wireless_uart_send_string(send_buffer);
+                    safe_track_encoder_totals_snapshot(
+                        &status_left_total,
+                        &status_right_total);
+                    status_average_count = safe_track_average_count_get(
+                        status_left_total,
+                        status_right_total);
+                    sprintf(
+                        send_buffer,
+                        "ODOM Ltotal=%ld Rtotal=%ld AVG=%ld DIST~%ldmm TARGET=%lu\r\n",
+                        (long)status_left_total,
+                        (long)status_right_total,
+                        (long)status_average_count,
+                        (long)safe_track_distance_mm_get(status_average_count),
+                        (unsigned long)safe_track_param_lap_count);
+                    wireless_uart_send_string(send_buffer);
                 }break;
 
                 case 'H':
@@ -2341,7 +2526,7 @@ int main (void)
                 safe_track_black_peak = safe_track_black_count;
             }
 
-            if((safe_track_elapsed_ms >= SAFE_TRACK_LAP_MINIMUM_MS)
+            if((safe_track_elapsed_ms >= SAFE_TRACK_FINISH_ENABLE_MS)
                 && (safe_track_black_count >= SAFE_TRACK_FINISH_BLACK_MIN))
             {
                 safe_track_finish_ticks ++;
@@ -2351,31 +2536,19 @@ int main (void)
                 safe_track_finish_ticks = 0;
             }
 
+            if(safe_track_encoder_stop_pending)
+            {
+                safe_track_lap_stop_report("ENCODER LAP DISTANCE");
+            }
 #if SAFE_TRACK_USE_IR8_UART
-            if(safe_track_sensor_age_ms >= SAFE_TRACK_SENSOR_TIMEOUT_MS)
+            else if(safe_track_sensor_age_ms >= SAFE_TRACK_SENSOR_TIMEOUT_MS)
             {
                 safe_track_stop("IR8 UART DATA TIMEOUT 100ms");
             }
-            else
 #endif
-            if(safe_track_finish_ticks >= SAFE_TRACK_FINISH_CONFIRM_TICKS)
+            else if(safe_track_finish_ticks >= SAFE_TRACK_FINISH_CONFIRM_TICKS)
             {
-                finished_lap_ms = safe_track_elapsed_ms;
-                recommended_scale_x1000 =
-                    (finished_lap_ms * 1000UL) / SAFE_TRACK_LAP_TARGET_MS;
-                safe_track_stop("LAP FINISH LINE");
-                sprintf(
-                    send_buffer,
-                    "LAP time=%lums target=%ums black=%u peak=%u scale_x1000=%lu "
-                    "NEXT BASE=%lu\r\n",
-                    (unsigned long)finished_lap_ms,
-                    SAFE_TRACK_LAP_TARGET_MS,
-                    safe_track_black_count,
-                    safe_track_black_peak,
-                    (unsigned long)recommended_scale_x1000,
-                    (unsigned long)((safe_track_active_base
-                        * recommended_scale_x1000 + 500UL) / 1000UL));
-                wireless_uart_send_string(send_buffer);
+                safe_track_lap_stop_report("3+ BLACK CHANNELS");
             }
             else if(print_elapsed_ms >= SAFE_TRACK_PRINT_PERIOD_MS)
             {
