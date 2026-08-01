@@ -52,11 +52,11 @@
 // 电机重新安装后的闭环测试参数：32 细分，目标限制在水平零点附近 +/-20 度。
 // 位置误差经 P 控制器转换为 STEP 脉冲频率；本阶段故意限制速度和加速度。
 #define STEPPER_TARGET_LIMIT_X100            (2000)
-#define STEPPER_TEST_TRIP_LIMIT_X100         (2500)
+#define STEPPER_TEST_TRIP_LIMIT_X100         (3000)
 #define STEPPER_POSITION_DEADBAND_X100       (15)
 #define STEPPER_KP_PPS_PER_DEG               (400U)
 #define STEPPER_MIN_FREQUENCY_PPS            (100U)
-#define STEPPER_MAX_FREQUENCY_PPS            (1600U)
+#define STEPPER_MAX_FREQUENCY_PPS            (1800U)
 #define STEPPER_SLEW_PPS_PER_MS              (50)
 
 // 电机重新安装后实测机械极限约为 115.22~213.66 度；保留至少 5 度余量。
@@ -115,10 +115,10 @@
 // 串级双环 PID：位置外环输出目标球速，速度内环输出摆杆目标角。
 // 所有量均使用 x100 定点数：位置 cm、速度 cm/s、角度 deg。
 // 正球速表示向右；机构实测正摆角使球向左，因此速度环输出到摆角时需要反号。
-#define GENERIC_POSITION_PID_KP_X100         (600)   // 8926ff0 profile: 3.50 (cm/s)/cm
+#define GENERIC_POSITION_PID_KP_X100         (605)   // 8926ff0 profile: 3.50 (cm/s)/cm
 #define GENERIC_POSITION_PID_KI_X100         (8)     // 8926ff0 profile: 0.08 (cm/s)/(cm*s)
-#define GENERIC_POSITION_PID_KD_RIGHT_X100   (200)   // 8926ff0 profile: 1.00 in both directions
-#define GENERIC_POSITION_PID_KD_LEFT_X100    (200)
+#define GENERIC_POSITION_PID_KD_RIGHT_X100   (170)// 8926ff0 profile: 1.00 in both directions
+#define GENERIC_POSITION_PID_KD_LEFT_X100    (172)
 #define GENERIC_POSITION_PID_I_LIMIT_X100    (200)   // target-speed integral term +/-2.00cm/s
 #define GENERIC_POSITION_PID_SPEED_LIMIT_X100 (2000) // target-ball-speed limit +/-20.00cm/s
 #define GENERIC_POSITION_BRAKE_RIGHT_X100    (1600)  // 8926ff0 braking planner: 15.00cm/s^2
@@ -146,7 +146,7 @@
 // tuning cannot change the fixed S1 competition trajectory.
 #define S2_POSITION_PID_KP_X100              (360)
 #define S2_POSITION_PID_KI_X100              (8)
-#define S2_POSITION_PID_KD_RIGHT_X100        (70)
+#define S2_POSITION_PID_KD_RIGHT_X100        (100)
 #define S2_POSITION_PID_KD_LEFT_X100         (100)
 #define S2_POSITION_PID_I_LIMIT_X100         (200)
 #define S2_POSITION_PID_SPEED_LIMIT_X100     (2000)
@@ -154,7 +154,7 @@
 #define S2_POSITION_BRAKE_LEFT_X100          (1500)
 
 #define POSITION_SPEED_ACCEL_X100_PER_S      (25000) // 目标球速加速斜率 200.00cm/s^2
-#define POSITION_SETTLE_BAND_X100            (8)     // 位置稳定带 +/-0.08cm
+#define POSITION_SETTLE_BAND_X100            (5)     // 位置稳定带 +/-0.08cm
 #define POSITION_INTEGRAL_FREEZE_X100        (20)    // 目标附近不积累位置积分 +/-0.20cm
 #define POSITION_LANDING_ARM_DISTANCE_X100   (200)   // use landing capture only after travel of at least 2.00cm
 #define POSITION_LANDING_BAND_X100           (95)    // measured first-stop window: strictly inside +/-1.00cm
@@ -243,27 +243,27 @@
 
 #define GENERIC_SPEED_PID_KP_X100            (110)    // 8926ff0 speed-loop profile
 #define GENERIC_SPEED_PID_KI_X100            (10)
-#define GENERIC_SPEED_PID_KD_X100            (3)
+#define GENERIC_SPEED_PID_KD_X100            (5)
 #define GENERIC_SPEED_PID_I_LIMIT_X100       (250)
 #define GENERIC_SPEED_PID_ACCEL_LIMIT_X100   (5000)
-#define GENERIC_SPEED_PID_POS_ANGLE_X100     (800)
-#define GENERIC_SPEED_PID_NEG_ANGLE_X100     (800)
+#define GENERIC_SPEED_PID_POS_ANGLE_X100     (1000)
+#define GENERIC_SPEED_PID_NEG_ANGLE_X100     (1000)
 
 #define S1_SPEED_PID_KP_X100                 (80)    // fixed KEY1 competition profile
 #define S1_SPEED_PID_KI_X100                 (10)
 #define S1_SPEED_PID_KD_X100                 (3)
 #define S1_SPEED_PID_I_LIMIT_X100            (250)
 #define S1_SPEED_PID_ACCEL_LIMIT_X100        (5000)
-#define S1_SPEED_PID_POS_ANGLE_X100          (800)
-#define S1_SPEED_PID_NEG_ANGLE_X100          (800)
+#define S1_SPEED_PID_POS_ANGLE_X100          (1000)
+#define S1_SPEED_PID_NEG_ANGLE_X100          (1000)
 
 #define S2_SPEED_PID_KP_X100                 (100)
 #define S2_SPEED_PID_KI_X100                 (10)
 #define S2_SPEED_PID_KD_X100                 (5)
 #define S2_SPEED_PID_I_LIMIT_X100            (250)
 #define S2_SPEED_PID_ACCEL_LIMIT_X100        (5000)
-#define S2_SPEED_PID_POS_ANGLE_X100          (800)
-#define S2_SPEED_PID_NEG_ANGLE_X100          (800)
+#define S2_SPEED_PID_POS_ANGLE_X100          (1000)
+#define S2_SPEED_PID_NEG_ANGLE_X100          (1000)
 #define SPEED_SETTLE_BAND_X100               (15)    // 速度稳定带 +/-0.15cm/s
 
 #define PID_INTEGRAL_SCALE                   (100000)
@@ -312,6 +312,8 @@
 #define SPEED_STICTION_ANGLE_STEP_X100       (25)    // add 0.25deg after a no-motion timeout
 #define SPEED_STICTION_LEFT_MAX_X100         (650)   // adaptive launch ceiling +6.50deg
 #define SPEED_STICTION_RIGHT_MAX_X100        (-650)  // adaptive launch floor -6.50deg
+
+
 
 typedef enum
 {
@@ -657,6 +659,7 @@ static uint8  s_manual_pulse_last_sequence = 0;
 static manual_pulse_phase_enum s_manual_pulse_phase = MANUAL_PULSE_PHASE_IDLE;
 static uint32 s_manual_pulse_ramp_loops = 0;
 static uint32 s_manual_pulse_hold_counter = 0;
+
 
 static uint8 cascade_profile_is_key1_fixed (void)
 {
@@ -4865,6 +4868,7 @@ static void center_hold_button_update (void)
         }break;
     }
 }
+
 
 int main (void)
 {
